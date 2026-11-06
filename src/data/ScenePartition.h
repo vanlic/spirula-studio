@@ -13,6 +13,7 @@
 #include "data/LabelField.h"
 #include "data/SparseEdit.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <exception>
@@ -26,14 +27,17 @@ enum class CovisibilitySource { Auto = 0, Tracks, Projection, Proximity };
 const char* covisibility_source_name(CovisibilitySource s);
 bool covisibility_source_from_name(const std::string& s, CovisibilitySource& out);
 
-// Graph cuts the joint camera-point visibility graph; ViewGraph cuts the
-// cameras by covisibility and derives the regions from camera positions.
-enum class PartitionMethod { Graph = 0, ViewGraph };
+enum class PartitionMethod { Graph = 0, ViewGraph, AxisAligned };
 const char* partition_method_name(PartitionMethod m);
 bool partition_method_from_name(const std::string& s, PartitionMethod& out);
 
+enum class PanoramaRoute { Road, Loop };
+const char* panorama_route_name(PanoramaRoute route);
+bool panorama_route_from_name(const std::string& s, PanoramaRoute& out);
+
 struct PartitionOptions {
     PartitionMethod method = PartitionMethod::ViewGraph;
+    PanoramaRoute panorama_route = PanoramaRoute::Road;
     // Exactly `parts` parts when > 0; otherwise as many as it takes to keep
     // every part at or under `max_images` cameras.
     int parts = 0;
@@ -55,11 +59,14 @@ struct PartitionOptions {
     int proximity_neighbours = 8;
 };
 
-// Who sees what: point i is seen by frames [beg[i], beg[i+1]) of `frame`.
+// Observers of point i are frame[beg[i]..beg[i+1]). A station map means
+// both the observer IDs and graph nodes index stations instead of images.
 struct Covisibility {
     std::vector<int64_t> beg;
     std::vector<int32_t> frame;
     graph::WeightedGraph cameras;
+    std::vector<int32_t> frame_station;
+    std::vector<std::array<double, 3>> station_centers;
     CovisibilitySource source = CovisibilitySource::Proximity;
     int64_t num_points() const { return beg.empty() ? 0 : (int64_t)beg.size() - 1; }
     bool has_tracks() const { return !frame.empty(); }
@@ -72,9 +79,8 @@ struct PartitionCancelled : std::exception {
     const char* what() const noexcept override { return "partition: cancelled"; }
 };
 
-// Builds the covisibility the options ask for. `tracks`, when it has any, is
-// the model's own (read_sparse_stats); Auto takes tracks, then projection of
-// the seed cloud, then proximity. Throws only when cancelled.
+// Auto tries model tracks, projection and proximity. AxisAligned uses
+// whole panorama stations and falls back from tracks to proximity directly.
 Covisibility build_covisibility(const ParsedDataset& ds, const SparseStats* tracks,
                                 const PartitionOptions& opt, const PartitionLog& log = {},
                                 const std::atomic<bool>* cancel = nullptr);
@@ -92,16 +98,36 @@ struct ScenePartition {
     // and the part whose core the frame is in.
     std::vector<std::string> frame_names;
     std::vector<int32_t> frame_label;
+    std::vector<int32_t> initial_frame_label;  // Axis-aligned preview only, not saved.
     // Per part: frame indices of its ring, sorted.
     std::vector<std::vector<int32_t>> ring;
-    // Per seed point (file order): its owner. Per part: the points it seeds
-    // from -- everything its core and ring cameras see, plus what it owns.
+    // Point owners and per-part seed lists, both indexed in source file order.
     std::vector<int32_t> point_label;
     std::vector<std::vector<int64_t>> part_points;
     // Who owns each point of space (data/LabelField.h), and the cameras'
     // positions [N,3], which orient a splat's normal at the merge.
     std::shared_ptr<LabelField> field;
     std::vector<float> frame_centers;
+
+    struct AxisSplit {
+        int axis;
+        double cut;
+        int low, high;  // Node index or bitwise complement of the leaf label.
+    };
+    struct Axes {
+        std::array<double, 3> origin{};
+        std::array<std::array<double, 3>, 3> basis{};
+        double confidence = 0;
+        std::string up_source;
+        bool heading_fallback = false;
+        bool road_fallback = false;
+        std::vector<AxisSplit> splits;
+
+        int owner(const double p[3]) const;
+        std::shared_ptr<const Region> region(int part) const;
+    };
+    std::shared_ptr<Axes> axes;
+    std::shared_ptr<const Region> region(int part) const;
 
     bool empty() const { return num_parts == 0; }
     // Core plus ring, sorted.

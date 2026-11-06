@@ -843,7 +843,7 @@ void TrainerSession::apply_partition_config(ParsedDataset& d) {
              {cfg.partition_part, (long long)a.frames_after, (long long)a.core,
               (long long)a.ring, (long long)a.points_after}));
     if (a.missing > 0) log(lfmt(lmsg::partition_missing_frames, {(long long)a.missing}));
-    if (&d == &ds && p.field) roi = std::make_shared<LabelRegion>(p.field, cfg.partition_part);
+    if (&d == &ds) roi = p.region(cfg.partition_part);
 }
 
 void TrainerSession::load_region() {

@@ -5,6 +5,7 @@
 #include "data/DatasetParser.h"
 #include "data/Json.h"
 #include "data/JsonWrite.h"
+#include "sfm/core/RigFile.h"
 
 #include <algorithm>
 #include <cctype>
@@ -15,6 +16,7 @@
 #include <fstream>
 #include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 
 namespace fs = std::filesystem;
@@ -150,30 +152,111 @@ std::string filter_images_bin(const std::string& src,
     return out;
 }
 
-// frames.bin (COLMAP 3.12+): per frame an id, a rig id, rig_from_world, then
-// its data ids. "" when the layout does not account for every byte -- a file
-// this cannot read exactly is one it must not rewrite.
-std::string move_frames_bin(const std::string& src, const Sim3& moved) {
+// COLMAP frames.bin stores frame and rig IDs, seven pose doubles and typed data IDs.
+template <class Visit>
+bool visit_frames_bin(const std::string& src, Visit visit) {
     const char* p = src.data();
     const char* end = src.data() + src.size();
-    if ((size_t)(end - p) < sizeof(uint64_t)) return {};
+    if ((size_t)(end - p) < sizeof(uint64_t)) return false;
     const uint64_t n = read_le<uint64_t>(p);
-    std::string out = src;
     for (uint64_t i = 0; i < n; i++) {
-        if (end - p < 4 + 4 + 8 * 7 + 4) return {};
+        if (end - p < 4 + 4 + 8 * 7 + 4) return false;
         p += 8;
-        const size_t at = (size_t)(p - src.data());
-        double pose[7];
-        std::memcpy(pose, p, sizeof pose);
-        move_w2c(moved, pose, pose + 4);
-        std::memcpy(&out[at], pose, sizeof pose);
-        p += sizeof pose;
+        const char* pose = p;
+        p += 7 * sizeof(double);
         const uint32_t ids = read_le<uint32_t>(p);
-        const size_t bytes = (size_t)ids * (4 + 4 + 8);
-        if ((size_t)(end - p) < bytes) return {};
-        p += bytes;
+        constexpr size_t id_bytes = 4 + 4 + 8;
+        if ((size_t)(end - p) / id_bytes < ids) return false;
+        visit(i, pose, p, ids);
+        p += ids * id_bytes;
     }
-    return p == end ? out : std::string();
+    return p == end;
+}
+
+std::string move_frames_bin(const std::string& src, const Sim3& moved) {
+    std::string out = src;
+    const bool ok = visit_frames_bin(src, [&](uint64_t, const char* at, const char*, uint32_t) {
+        double pose[7];
+        std::memcpy(pose, at, sizeof pose);
+        move_w2c(moved, pose, pose + 4);
+        std::memcpy(out.data() + (at - src.data()), pose, sizeof pose);
+    });
+    return ok ? out : std::string();
+}
+
+void read_frame_members(const fs::path& model, const std::map<int32_t, int32_t>& index_of_id, SparseStats& out) {
+    out.image_rig_frame.assign(out.image_names.size(), -1);
+    auto add_frame = [&](const double pose[7]) {
+        const sfm::Mat3 R = sfm::quaternionToRotation({pose[0], pose[1], pose[2], pose[3]});
+        const auto center = sfm::mul(sfm::transpose(R), sfm::Vec3{-pose[4], -pose[5], -pose[6]});
+        out.rig_centers.push_back({center.x, center.y, center.z});
+        return (int32_t)out.rig_centers.size() - 1;
+    };
+    auto add_image = [&](int32_t frame, uint64_t image) {
+        if (image > INT32_MAX) return;
+        const auto it = index_of_id.find((int32_t)image);
+        if (it != index_of_id.end()) out.image_rig_frame[(size_t)it->second] = frame;
+    };
+    const fs::path binary = model / "frames.bin";
+    if (fs::is_regular_file(binary)) {
+        const bool ok = visit_frames_bin(read_file(binary),
+            [&](uint64_t, const char* at, const char* ids, uint32_t count) {
+                double pose[7];
+                std::memcpy(pose, at, sizeof pose);
+                const int32_t frame = add_frame(pose);
+                for (uint32_t j = 0; j < count; j++) {
+                    constexpr int32_t kCameraSensor = 0;
+                    const int32_t sensor = read_le<int32_t>(ids);
+                    ids += sizeof(uint32_t);
+                    const uint64_t id = read_le<uint64_t>(ids);
+                    if (sensor == kCameraSensor) add_image(frame, id);
+                }
+            });
+        if (ok) return;
+        out.rig_centers.clear();
+        std::fill(out.image_rig_frame.begin(), out.image_rig_frame.end(), -1);
+    }
+    std::ifstream f(model / "frames.txt");
+    for (std::string line; std::getline(f, line);) {
+        std::istringstream row(line);
+        uint32_t id, rig, count;
+        double pose[7];
+        if (!(row >> id >> rig >> pose[0] >> pose[1] >> pose[2] >> pose[3] >> pose[4] >> pose[5] >> pose[6] >> count))
+            continue;
+        std::vector<uint64_t> images;
+        for (uint32_t j = 0; j < count; j++) {
+            std::string type;
+            uint32_t sensor;
+            uint64_t image;
+            if (!(row >> type >> sensor >> image)) break;
+            if (type == "CAMERA") images.push_back(image);
+        }
+        if (!row || images.empty()) continue;
+        const int32_t frame = add_frame(pose);
+        for (uint64_t image : images) add_image(frame, image);
+    }
+    if (!out.rig_centers.empty()) return;
+    out.image_rig_frame.clear();
+    const fs::path native = model / "rigs.txt";
+    std::ifstream rig_file(native);
+    std::string signature;
+    if (!std::getline(rig_file, signature) || signature.rfind("# Rig calibration from spirula sfm", 0) != 0) return;
+    std::vector<sfm::RigCalib> calibration;
+    sfm::RigTable table;
+    try {
+        table = sfm::readRigCalibration(rig_file, native.string(), out.image_names, calibration);
+    } catch (const std::runtime_error&) {
+        return;
+    }
+    if (table.empty()) return;
+    out.image_rig_frame.assign(out.image_names.size(), -1);
+    int32_t station = 0;
+    for (const auto& rig : table.rigs)
+        for (const auto& images : rig.frames) {
+            for (uint32_t image : images)
+                if (image != sfm::kNoImage) out.image_rig_frame[image] = station;
+            station++;
+        }
 }
 
 // points3D.bin: the same, except that a track entry naming a dropped image
@@ -539,7 +622,7 @@ std::string resolve_sparse_dir(const std::string& path) {
 }
 
 
-SparseStats read_sparse_stats(const std::string& dataset_dir) {
+SparseStats read_sparse_stats(const std::string& dataset_dir, bool include_rig_frames) {
     SparseStats out;
     if (sparse_format_of(dataset_dir) != SparseFormat::Colmap) return out;
     bool text = false;
@@ -575,6 +658,7 @@ SparseStats read_sparse_stats(const std::string& dataset_dir) {
             out.image_points.push_back(seen);
             p += pts * 24;
         }
+        if (include_rig_frames) read_frame_members(model, index_of_id, out);
         const std::string pt = read_file(fs::path(model) / "points3D.bin");
         p = pt.data();
         end = p + pt.size();
@@ -633,6 +717,7 @@ SparseStats read_sparse_stats(const std::string& dataset_dir) {
             out.image_points.push_back(seen);
         }
     }
+    if (include_rig_frames) read_frame_members(model, index_of_id, out);
     std::ifstream f(fs::path(model) / "points3D.txt");
     std::string line;
     out.track_beg.push_back(0);

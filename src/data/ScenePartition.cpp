@@ -2,10 +2,13 @@
 
 #include "data/ScenePartition.h"
 
+#include "core/CameraModel.h"
 #include "data/CameraMath.h"
 #include "data/Json.h"
 #include "data/JsonWrite.h"
 #include "data/Knn.h"
+#include "data/PanoramaPartition.h"
+#include "data/PartitionVisibility.h"
 #include "external/stb_image.h"
 #include "external/stb_image_write.h"
 
@@ -14,6 +17,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <stdexcept>
@@ -409,12 +413,8 @@ Visibility visibility_of(const ParsedDataset& ds, const Covisibility& cov,
         float* w = &v.cw[(size_t)v.cbeg[(size_t)c]];
         const int64_t m = v.cbeg[(size_t)c + 1] - v.cbeg[(size_t)c];
         if (m == 0) continue;
-        std::vector<float> sorted(w, w + m);
-        std::nth_element(sorted.begin(), sorted.begin() + (m * 95) / 100, sorted.end());
-        const float cap = sorted[(size_t)((m * 95) / 100)];
-        double total = 0;
-        for (int64_t k = 0; k < m; k++) total += (w[k] = std::min(w[k], cap));
-        for (int64_t k = 0; k < m; k++) w[k] = (float)(w[k] / total);
+        std::vector<float> scratch;
+        normalize_observation_weights(w, (size_t)m, scratch);
     }
     {
         std::vector<int64_t> fill(v.cbeg.begin(), v.cbeg.end() - 1);
@@ -613,12 +613,23 @@ const char* covisibility_source_name(CovisibilitySource s) {
 }
 
 const char* partition_method_name(PartitionMethod m) {
+    if (m == PartitionMethod::AxisAligned) return "axis-aligned";
     return m == PartitionMethod::ViewGraph ? "viewgraph" : "graph";
 }
 
 bool partition_method_from_name(const std::string& s, PartitionMethod& out) {
-    for (PartitionMethod m : {PartitionMethod::Graph, PartitionMethod::ViewGraph})
+    for (PartitionMethod m : {PartitionMethod::Graph, PartitionMethod::ViewGraph, PartitionMethod::AxisAligned})
         if (s == partition_method_name(m)) { out = m; return true; }
+    return false;
+}
+
+const char* panorama_route_name(PanoramaRoute route) {
+    return route == PanoramaRoute::Road ? "road" : "loop";
+}
+
+bool panorama_route_from_name(const std::string& s, PanoramaRoute& out) {
+    for (PanoramaRoute route : {PanoramaRoute::Road, PanoramaRoute::Loop})
+        if (s == panorama_route_name(route)) { out = route; return true; }
     return false;
 }
 
@@ -636,7 +647,8 @@ bool covisibility_source_from_name(const std::string& s, CovisibilitySource& out
 namespace {
 
 bool covisibility_from_tracks(const ParsedDataset& ds, const SparseStats& st, Covisibility& out,
-                              const PartitionLog& log, const std::atomic<bool>* cancel) {
+                              const PartitionLog& log, const std::atomic<bool>* cancel,
+                              const std::vector<int32_t>& stations = {}) {
     if (st.empty() || (int64_t)st.track_beg.size() - 1 != ds.points.num()) return false;
     const FrameIndex index(ds.image_filenames);
     std::vector<int32_t> image_frame(st.image_names.size(), -1);
@@ -649,18 +661,77 @@ bool covisibility_from_tracks(const ParsedDataset& ds, const SparseStats& st, Co
     out.beg.assign(1, 0);
     out.frame.clear();
     out.frame.reserve(st.track_image.size());
+    std::vector<int32_t> observers;
     for (size_t i = 0; i + 1 < st.track_beg.size(); i++) {
         if (i % 65536 == 0) stop_if(cancel);
         for (int64_t k = st.track_beg[i]; k < st.track_beg[i + 1]; k++) {
             const int32_t f = image_frame[(size_t)st.track_image[(size_t)k]];
-            if (f >= 0) out.frame.push_back(f);
+            if (f < 0) continue;
+            if (stations.empty()) out.frame.push_back(f);
+            else observers.push_back(stations[(size_t)f]);
+        }
+        if (!stations.empty()) {
+            std::sort(observers.begin(), observers.end());
+            out.frame.insert(out.frame.end(), observers.begin(), std::unique(observers.begin(), observers.end()));
+            observers.clear();
         }
         out.beg.push_back((int64_t)out.frame.size());
     }
-    out.cameras = camera_graph_of(out.beg, out.frame, (size_t)ds.num_cameras, cancel);
+    const size_t count = stations.empty() ? (size_t)ds.num_cameras
+        : (size_t)(*std::max_element(stations.begin(), stations.end()) + 1);
+    out.cameras = camera_graph_of(out.beg, out.frame, count, cancel);
     out.source = CovisibilitySource::Tracks;
     (void)log;
     return true;
+}
+
+std::vector<int32_t> panorama_stations(const ParsedDataset& ds, const SparseStats* tracks,
+                                       std::vector<std::array<double, 3>>& centers) {
+    std::vector<int32_t> station((size_t)ds.num_cameras, -1);
+    const int spherical = (int)CameraModelType::EQUIRECTANGULAR;
+    if (ds.camera_models.size() == station.size() &&
+        std::all_of(ds.camera_models.begin(), ds.camera_models.end(),
+                    [&](int model) { return model == spherical; })) {
+        std::iota(station.begin(), station.end(), 0);
+        return station;
+    }
+    if (tracks && !tracks->image_rig_frame.empty() && tracks->image_rig_frame.size() == tracks->image_names.size()) {
+        const FrameIndex index(ds.image_filenames);
+        std::unordered_map<int32_t, int32_t> compact;
+        for (size_t i = 0; i < tracks->image_names.size(); i++) {
+            const int32_t f = index.find(tracks->image_names[i]);
+            const int32_t rig = tracks->image_rig_frame[i];
+            if (f >= 0 && rig >= 0)
+                station[(size_t)f] = compact.emplace(rig, (int32_t)compact.size()).first->second;
+        }
+        if (compact.size() < station.size() && std::find(station.begin(), station.end(), -1) == station.end()) {
+            if (!tracks->rig_centers.empty()) {
+                centers.resize(compact.size());
+                for (const auto& row : compact) centers[row.second] = tracks->rig_centers.at((size_t)row.first);
+            }
+            return station;
+        }
+    }
+
+    // FrameExtract's synchronized 360 faces are cam0..5 or cam0..9 / frame number.
+    std::unordered_map<std::string, unsigned> face_sets;
+    std::unordered_map<std::string, int32_t> positions;
+    for (size_t i = 0; i < station.size(); i++) {
+        const fs::path path(ds.image_filenames[i]);
+        const std::string face = path.parent_path().filename().string();
+        const std::string stem = path.stem().string();
+        if (ds.camera_models.size() != station.size() || ds.camera_models[i] != (int)CameraModelType::PINHOLE ||
+            face.size() != 4 || face.compare(0, 3, "cam") != 0 || face[3] < '0' || face[3] > '9' ||
+            stem.size() < 5 || !std::all_of(stem.begin(), stem.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            throw std::runtime_error("axis-aligned partition requires panoramas or synchronized 360 faces");
+        const std::string parent = path.parent_path().parent_path().generic_string();
+        face_sets[parent] |= 1u << (face[3] - '0');
+        station[i] = positions.emplace(parent + "/" + stem, (int32_t)positions.size()).first->second;
+    }
+    for (const auto& entry : face_sets)
+        if (entry.second != 0x3fu && entry.second != 0x3ffu)
+            throw std::runtime_error("axis-aligned partition could not identify all 360 face folders");
+    return station;
 }
 
 bool covisibility_from_projection(const ParsedDataset& ds, const PartitionOptions& opt,
@@ -772,6 +843,17 @@ Covisibility build_covisibility(const ParsedDataset& ds, const SparseStats* trac
     Covisibility out;
     if (ds.num_cameras == 0) return out;
     const CovisibilitySource want = opt.source;
+    if (opt.method == PartitionMethod::AxisAligned) {
+        if (want == CovisibilitySource::Projection)
+            throw std::runtime_error("axis-aligned partition uses tracks or station proximity");
+        out.frame_station = panorama_stations(ds, tracks, out.station_centers);
+        if (want != CovisibilitySource::Proximity && tracks &&
+            covisibility_from_tracks(ds, *tracks, out, log, cancel, out.frame_station) && out.has_tracks())
+            return out;
+        say(log, "panorama partition: station proximity; point coverage unavailable");
+        panorama_proximity(ds, out, opt.proximity_neighbours, cancel);
+        return out;
+    }
     if ((want == CovisibilitySource::Auto || want == CovisibilitySource::Tracks) && tracks &&
         covisibility_from_tracks(ds, *tracks, out, log, cancel))
         return out;
@@ -808,6 +890,13 @@ int64_t ScenePartition::core_count(int part) const {
     return n;
 }
 
+std::shared_ptr<const Region> ScenePartition::region(int part) const {
+    if (part < 0 || part >= num_parts) return {};
+    if (axes) return axes->region(part);
+    if (field) return std::make_shared<LabelRegion>(field, part);
+    return {};
+}
+
 ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
                                const PartitionOptions& opt, const PartitionLog& log,
                                const std::atomic<bool>* cancel) {
@@ -823,6 +912,10 @@ ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
     p.frame_centers.resize((size_t)n_cam * 3);
     for (int64_t i = 0; i < n_cam; i++)
         for (int r = 0; r < 3; r++) p.frame_centers[(size_t)i * 3 + r] = ds.c2w[(size_t)i * 12 + r * 4 + 3];
+    if (opt.method == PartitionMethod::AxisAligned) {
+        partition_panorama(ds, cov, p, log, cancel);
+        return p;
+    }
     std::vector<int64_t> pick;
     {
         const int64_t stride = std::max<int64_t>(1, (n_pts + std::max(1, opt.max_seeds) - 1) /
@@ -1082,7 +1175,7 @@ ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
             const uint32_t keep = (uint32_t)(std::clamp(opt.outside_seed_fraction, 0.0f, 1.0f) * 65536.0f);
             for (int64_t i = 0; i < n_pts; i++) {
                 if (p.point_label[(size_t)i] == k) { take[(size_t)i] = 1; continue; }
-                if (!tracked || ((uint32_t)((uint64_t)i * 2654435761u) >> 16) >= keep) continue;
+                if (!tracked || !keep_outside_seed((uint64_t)i, keep)) continue;
                 for (int64_t t = cov.beg[(size_t)i]; t < cov.beg[(size_t)i + 1]; t++)
                     if (in_part[(size_t)k][(size_t)cov.frame[(size_t)t]]) { take[(size_t)i] = 1; break; }
             }
@@ -1425,6 +1518,83 @@ void write_file(const std::string& path, const std::string& bytes) {
     std::fclose(f);
 }
 
+void write_axes(JsonWriter& w, const ScenePartition::Axes& axes) {
+    auto write_vector = [&](const std::array<double, 3>& v) {
+        w.array();
+        for (double x : v) w.raw(json_number_exact(x));
+        w.end();
+    };
+    w.key("axes").object();
+    w.key("origin");
+    write_vector(axes.origin);
+    w.key("basis").array();
+    for (const auto& axis : axes.basis) write_vector(axis);
+    w.end();
+    w.field("up_source", axes.up_source);
+    w.field("confidence", axes.confidence);
+    w.field("heading_fallback", axes.heading_fallback);
+    if (axes.road_fallback) w.field("road_fallback", true);
+    w.key("splits").array();
+    for (const auto& s : axes.splits)
+        w.array().value(s.axis).raw(json_number_exact(s.cut)).value(s.low).value(s.high).end();
+    w.end().end();
+}
+
+std::shared_ptr<ScenePartition::Axes> read_axes(const JsonValue* value, int parts, const std::string& path) {
+    const auto bad = [&] { return std::runtime_error(path + ": invalid axis-aligned partition geometry"); };
+    if (!value || !value->is_object()) throw bad();
+    const auto* origin = value->find("origin");
+    const auto* basis = value->find("basis");
+    const auto* splits = value->find("splits");
+    if (!origin || !basis || !splits || !basis->is_array() || basis->arr.size() != 3 ||
+        !splits->is_array() || splits->arr.size() != (size_t)(parts - 1)) throw bad();
+    const auto read_vector = [&](const JsonValue& v) {
+        std::array<double, 3> result{};
+        if (!v.is_array() || v.arr.size() != 3) throw bad();
+        for (int a = 0; a < 3; a++) {
+            result[a] = v.arr[a].as_double(std::numeric_limits<double>::quiet_NaN());
+            if (!std::isfinite(result[a])) throw bad();
+        }
+        return result;
+    };
+    auto axes = std::make_shared<ScenePartition::Axes>();
+    axes->origin = read_vector(*origin);
+    for (int a = 0; a < 3; a++) axes->basis[a] = read_vector(basis->arr[a]);
+    for (int a = 0; a < 3; a++)
+        for (int b = 0; b <= a; b++) {
+            const double dot = std::inner_product(axes->basis[a].begin(), axes->basis[a].end(), axes->basis[b].begin(), 0.0);
+            if (std::abs(dot - (a == b ? 1.0 : 0.0)) > 1e-6) throw bad();
+        }
+    axes->confidence = value->get_double("confidence", 0);
+    if (!(axes->confidence >= 0 && axes->confidence <= 1)) throw bad();
+    if (const auto* source = value->find("up_source")) axes->up_source = source->as_string();
+    if (const auto* fallback = value->find("heading_fallback")) axes->heading_fallback = fallback->as_bool();
+    if (const auto* fallback = value->find("road_fallback")) axes->road_fallback = fallback->as_bool();
+    std::vector<bool> visited_nodes(splits->arr.size()), visited_parts((size_t)parts);
+    for (size_t i = 0; i < splits->arr.size(); i++) {
+        const auto& s = splits->arr[i];
+        if (!s.is_array() || s.arr.size() != 4) throw bad();
+        const double axis = s.arr[0].as_double(-1), cut = s.arr[1].as_double(std::numeric_limits<double>::quiet_NaN());
+        if ((axis != 0 && axis != 1) || !std::isfinite(cut)) throw bad();
+        auto child = [&](int slot) {
+            const double d = s.arr[slot].as_double(0);
+            if (!(d >= -parts && d < (double)splits->arr.size()) || std::trunc(d) != d) throw bad();
+            const int j = (int)d;
+            if (j < 0) {
+                if (visited_parts[~j]) throw bad();
+                visited_parts[~j] = true;
+            } else {
+                if (j <= (int)i || visited_nodes[j]) throw bad();
+                visited_nodes[j] = true;
+            }
+            return j;
+        };
+        const int low = child(2), high = child(3);
+        axes->splits.push_back({(int)axis, cut, low, high});
+    }
+    return axes;
+}
+
 }  // namespace
 
 void write_partition(const ScenePartition& p, const std::string& json_path,
@@ -1436,9 +1606,11 @@ void write_partition(const ScenePartition& p, const std::string& json_path,
 
     std::string bin;
     bin.append(kBinMagic, 4);
-    put(bin, (uint32_t)2);
-    if (p.field) p.field->write(bin);
-    else LabelField().write(bin);
+    put(bin, (uint32_t)(p.axes ? 3 : 2));
+    if (!p.axes) {
+        if (p.field) p.field->write(bin);
+        else LabelField().write(bin);
+    }
     put(bin, (uint64_t)p.frame_centers.size() / 3);
     bin.append(reinterpret_cast<const char*>(p.frame_centers.data()),
                p.frame_centers.size() * sizeof(float));
@@ -1454,11 +1626,13 @@ void write_partition(const ScenePartition& p, const std::string& json_path,
     JsonWriter w;
     w.object();
     w.field("format", "spirula-scene-partition");
-    w.field("version", 1);
+    w.field("version", p.axes ? 2 : 1);
+    if (p.axes) write_axes(w, *p.axes);
     w.field("dataset", dataset);
     w.field("source", covisibility_source_name(p.source));
     w.key("options").object();
     w.field("method", partition_method_name(p.options.method));
+    if (p.axes) w.field("route", panorama_route_name(p.options.panorama_route));
     w.field("parts", p.options.parts);
     w.field("max_images", p.options.max_images);
     w.field("ring_fraction", p.options.ring_fraction);
@@ -1505,13 +1679,15 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
     if (const JsonValue* s = root.find("source"))
         covisibility_source_from_name(s->as_string(), p.source);
     if (const JsonValue* o = root.find("options"); o && o->is_object()) {
-        p.options.parts = (int)o->find("parts")->as_int(0);
+        p.options.parts = (int)o->get_double("parts", p.options.parts);
         p.options.max_images = (int)o->get_double("max_images", p.options.max_images);
         p.options.ring_fraction = (float)o->get_double("ring_fraction", p.options.ring_fraction);
         p.options.outside_seed_fraction =
             (float)o->get_double("outside_seed_fraction", p.options.outside_seed_fraction);
         if (const JsonValue* m = o->find("method"))
             partition_method_from_name(m->as_string(), p.options.method);
+        if (const JsonValue* route = o->find("route"))
+            panorama_route_from_name(route->as_string(), p.options.panorama_route);
         p.options.ring_min_points = (int)o->get_double("ring_min_points", p.options.ring_min_points);
         p.options.max_seeds = (int)o->get_double("max_seeds", p.options.max_seeds);
         if (const JsonValue* s = o->find("source"))
@@ -1521,7 +1697,10 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
         p.options.proximity_neighbours =
             (int)o->get_double("proximity_neighbours", p.options.proximity_neighbours);
     }
-    p.num_parts = (int)root.find("num_parts")->as_int(0);
+    const double num_parts = root.get_double("num_parts", 0);
+    if (!(num_parts >= 1 && num_parts <= 254) || std::trunc(num_parts) != num_parts)
+        throw std::runtime_error(json_path + ": invalid part count");
+    p.num_parts = (int)num_parts;
     p.cut_fraction = root.get_double("cut_fraction", 0.0);
     if (const JsonValue* a = root.find("frame_names"); a && a->is_array())
         for (const JsonValue& v : a->arr) p.frame_names.push_back(v.as_string());
@@ -1546,21 +1725,31 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
         throw std::runtime_error(bin_name + " is not a partition table");
     at = 4;
     uint32_t version = 0;
-    if (!get(bin, at, version) || version != 2)
+    if (!get(bin, at, version) || (version != 2 && version != 3))
         throw std::runtime_error(bin_name + ": unsupported version; compute the partition again");
-    size_t used = 0;
-    p.field = std::make_shared<LabelField>();
-    if (!LabelField::read(bin.data() + at, bin.size() - at, used, *p.field))
-        throw std::runtime_error(bin_name + ": bad label field");
-    at += used;
+    if (version == 3) {
+        if (p.options.method != PartitionMethod::AxisAligned)
+            throw std::runtime_error(json_path + ": method does not match partition table");
+        p.axes = read_axes(root.find("axes"), p.num_parts, json_path);
+    } else {
+        if (p.options.method == PartitionMethod::AxisAligned)
+            throw std::runtime_error(json_path + ": method does not match partition table");
+        size_t used = 0;
+        p.field = std::make_shared<LabelField>();
+        if (!LabelField::read(bin.data() + at, bin.size() - at, used, *p.field))
+            throw std::runtime_error(bin_name + ": bad label field");
+        at += used;
+    }
     uint64_t n_centers = 0;
-    if (!get(bin, at, n_centers) || at + n_centers * 12 > bin.size())
+    if (!get(bin, at, n_centers) || n_centers > (bin.size() - at) / 12)
         throw std::runtime_error(bin_name + ": truncated camera centres");
+    if (p.axes && n_centers != p.frame_names.size())
+        throw std::runtime_error(bin_name + ": camera count differs from the json");
     p.frame_centers.resize((size_t)n_centers * 3);
     std::memcpy(p.frame_centers.data(), bin.data() + at, (size_t)n_centers * 12);
     at += n_centers * 12;
     uint64_t n_pts = 0;
-    if (!get(bin, at, n_pts) || at + n_pts > bin.size())
+    if (!get(bin, at, n_pts) || n_pts > bin.size() - at)
         throw std::runtime_error(bin_name + ": truncated point labels");
     p.point_label.resize((size_t)n_pts);
     for (uint64_t i = 0; i < n_pts; i++) {
@@ -1574,7 +1763,7 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
     p.part_points.assign((size_t)n_parts, {});
     for (uint32_t k = 0; k < n_parts; k++) {
         uint64_t n = 0;
-        if (!get(bin, at, n) || at + n * 4 > bin.size())
+        if (!get(bin, at, n) || n > (bin.size() - at) / 4)
             throw std::runtime_error(bin_name + ": truncated part points");
         p.part_points[k].resize((size_t)n);
         for (uint64_t i = 0; i < n; i++) {

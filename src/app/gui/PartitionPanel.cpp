@@ -8,6 +8,7 @@
 #include "app/gui/Ui.h"
 #include "checkpoint/SplatMerge.h"
 #include "checkpoint/SplatPly.h"
+#include "i18n/catalog/Dataset.h"
 #include "i18n/catalog/Gui.h"
 #include "i18n/catalog/Partition.h"
 
@@ -47,9 +48,25 @@ ImVec4 part_vec(int part, float alpha = 1.0f) {
     return ImVec4(c[0], c[1], c[2], alpha);
 }
 
+spirula::RegionMesh axis_marker(const spirula::ScenePartition::Axes& axes, int a, double length) {
+    spirula::RegionMesh mesh;
+    for (int i = 0; i < 4; i++) {
+        const double u = (i == 0 || i == 3) ? -0.02 : 0.02;
+        const double v = i < 2 ? -0.02 : 0.02;
+        for (int k = 0; k < 3; k++)
+            mesh.xyz.push_back((float)(axes.origin[k] + length *
+                (u * axes.basis[(a + 1) % 3][k] + v * axes.basis[(a + 2) % 3][k])));
+    }
+    for (int k = 0; k < 3; k++) mesh.xyz.push_back((float)(axes.origin[k] + length * axes.basis[a][k]));
+    mesh.tri = {0, 4, 1, 1, 4, 2, 2, 4, 3, 3, 4, 0, 0, 1, 2, 0, 2, 3};
+    return mesh;
+}
+
 }  // namespace
 
-PartitionPanel::PartitionPanel() = default;
+PartitionPanel::PartitionPanel() {
+    _opt.panorama_route = spirula::PanoramaRoute::Loop;
+}
 
 PartitionPanel::~PartitionPanel() {
     _cancel = true;
@@ -76,7 +93,9 @@ void PartitionPanel::open(const std::string& dataset_dir, Hooks hooks) {
     _merge_error.clear();
     _runs.clear();
     _scanned = false;
+    _view_stage = 0;
     _show_part = -1;
+    _show_group = -1;
     _save_path = (fs::path(dataset_dir) / "partition.json").string();
     _runs_dir = (fs::path(dataset_dir) / "outputs").string();
     _merge_out = (fs::path(dataset_dir) / "merged.ply").string();
@@ -137,7 +156,7 @@ void PartitionPanel::run_load() {
     dcfg.require_image_files = false;
     ParsedDataset ds = parse_dataset(_dataset, dcfg, "");
     PostSplitCameras post = bake_post_split(ds, false, false);
-    spirula::SparseStats tracks = spirula::read_sparse_stats(_dataset);
+    spirula::SparseStats tracks = spirula::read_sparse_stats(_dataset, true);
     std::lock_guard<std::mutex> lk(_mu);
     _ds = std::move(ds);
     _post = std::move(post);
@@ -155,7 +174,9 @@ void PartitionPanel::run_compute() {
         std::lock_guard<std::mutex> lk(_mu);
         opt = _compute_opt;
     }
+    const auto axis = spirula::PartitionMethod::AxisAligned;
     const bool reuse = _cov_valid && _cov_opt.source == opt.source &&
+                       (_cov_opt.method == axis) == (opt.method == axis) &&
                        _cov_opt.max_projected_points == opt.max_projected_points &&
                        _cov_opt.proximity_neighbours == opt.proximity_neighbours;
     if (!reuse) {
@@ -168,14 +189,23 @@ void PartitionPanel::run_compute() {
     spirula::ScenePartition part = spirula::partition_scene(_ds, _cov, opt, log, &_cancel);
     if (_cancel.load()) throw spirula::PartitionCancelled();
     std::vector<spirula::RegionMesh> meshes;
-    if (part.field && !part.field->empty()) {
+    if (part.axes || (part.field && !part.field->empty())) {
         std::vector<float> xyz;
         const int64_t n = _ds.points.num(), stride = std::max<int64_t>(1, n / 200000);
         for (int64_t i = 0; i < n; i += stride)
             for (int r = 0; r < 3; r++) xyz.push_back((float)(_ds.points.xyz[(size_t)i * 3 + r] + _ds.center[r]));
-        const spirula::Aabb box = xyz.empty() ? part.field->bounds()
-                                              : spirula::robust_bounds(xyz.data(), (int64_t)xyz.size() / 3);
-        meshes = spirula::label_boundary_meshes(*part.field, box, 96, &_cancel);
+        if (part.axes) {
+            xyz.insert(xyz.end(), part.frame_centers.begin(), part.frame_centers.end());
+            const auto box = spirula::robust_bounds(xyz.data(), (int64_t)xyz.size() / 3);
+            for (int k = 0; k < part.num_parts; k++) {
+                if (_cancel.load()) throw spirula::PartitionCancelled();
+                meshes.push_back(spirula::region_boundary_mesh(*part.region(k), box, 48));
+            }
+        } else {
+            const auto box = xyz.empty() ? part.field->bounds()
+                                        : spirula::robust_bounds(xyz.data(), (int64_t)xyz.size() / 3);
+            meshes = spirula::label_boundary_meshes(*part.field, box, 96, &_cancel);
+        }
         if (_cancel.load()) throw spirula::PartitionCancelled();
     }
     std::lock_guard<std::mutex> lk(_mu);
@@ -241,6 +271,8 @@ void PartitionPanel::poll() {
             _saved_path.clear();
             _scanned = false;
             if (_show_part >= _part.num_parts) _show_part = -1;
+            if (_part.initial_frame_label.empty()) _view_stage = 0;
+            _show_group = -1;
             _view_dirty = true;
             break;
         case Job::Merge:
@@ -257,7 +289,8 @@ bool PartitionPanel::options_changed() const {
     const spirula::PartitionOptions& b = _opt;
     return a.parts != b.parts || a.max_images != b.max_images ||
            a.ring_fraction != b.ring_fraction || a.ring_min_points != b.ring_min_points ||
-           a.method != b.method || a.outside_seed_fraction != b.outside_seed_fraction ||
+           a.method != b.method || a.panorama_route != b.panorama_route ||
+           a.outside_seed_fraction != b.outside_seed_fraction ||
            a.max_seeds != b.max_seeds ||
            a.source != b.source;
 }
@@ -275,28 +308,26 @@ void PartitionPanel::refresh_view() {
     std::vector<float> cam_rgb;
     std::shared_ptr<const spirula::RegionOverlay> overlay;
     if (_part_valid && _part.num_parts > 0 && (int64_t)_part.frame_label.size() == n_cam) {
-        const int solo = _show_part;
-        // Which cameras and points the shown part trains on.
-        std::vector<uint8_t> cam_role((size_t)n_cam, 0);   // 0 other, 1 ring, 2 core
-        if (solo >= 0) {
-            for (int32_t f : _part.ring[(size_t)solo]) cam_role[(size_t)f] = 1;
-            for (int64_t i = 0; i < n_cam; i++)
-                if (_part.frame_label[(size_t)i] == solo) cam_role[(size_t)i] = 2;
-        }
+        const bool initial = _view_stage == 1;
+        const auto& labels = initial ? _part.initial_frame_label : _part.frame_label;
+        const int solo = initial ? _show_group : _show_part;
+        std::vector<uint8_t> in_ring((size_t)n_cam, 0);
+        if (!initial && solo >= 0)
+            for (int32_t f : _part.ring[(size_t)solo]) in_ring[(size_t)f] = 1;
         cam_rgb.resize((size_t)n_cam * 3);
         for (int64_t i = 0; i < n_cam; i++) {
             float c[3];
-            const int label = _part.frame_label[(size_t)i];
+            const int label = labels[(size_t)i];
             spirula::part_color(label, c);
             float mul = 1.0f, add = 0.0f;
-            if (solo >= 0) {
-                if (cam_role[(size_t)i] == 0) { mul = 0.0f; add = 0.22f; }
-                else if (cam_role[(size_t)i] == 1) { spirula::part_color(solo, c); mul = 0.45f; add = 0.18f; }
+            if (solo >= 0 && label != solo) {
+                if (in_ring[(size_t)i]) { spirula::part_color(solo, c); mul = 0.45f; add = 0.18f; }
+                else { mul = 0.0f; add = 0.22f; }
             }
             for (int k = 0; k < 3; k++) cam_rgb[(size_t)i * 3 + k] = c[k] * mul + add;
         }
 
-        if ((int64_t)_part.point_label.size() == n_pts) {
+        if (!initial && (int64_t)_part.point_label.size() == n_pts) {
             std::vector<uint8_t> in_part;
             if (solo >= 0) {
                 in_part.assign((size_t)n_pts, 0);
@@ -325,9 +356,8 @@ void PartitionPanel::refresh_view() {
                     show.points.rgb.push_back((uint8_t)std::lround(std::clamp(c[k], 0.0f, 1.0f) * 255.0f));
             }
         }
-        if (_show_grid && !_part_meshes.empty()) {
-            // Each part's boundary: the field is in the dataset's frame, the
-            // points it is drawn with less their centre.
+        if (!initial && _show_grid && !_part_meshes.empty()) {
+            // Region meshes are in the source frame; preview points are centered.
             const float to_points[12] = {1, 0, 0, (float)-_ds.center[0], 0, 1, 0, (float)-_ds.center[1],
                                          0, 0, 1, (float)-_ds.center[2]};
             auto ov = std::make_shared<spirula::RegionOverlay>();
@@ -336,6 +366,12 @@ void PartitionPanel::refresh_view() {
                 float c[3];
                 spirula::part_color(k, c);
                 ov->add(_part_meshes[(size_t)k], c, to_points);
+            }
+            if (_part.axes) {
+                const auto box = spirula::robust_bounds(_part.frame_centers.data(), n_cam);
+                const double length = 0.08 * std::max({box.hi[0] - box.lo[0], box.hi[1] - box.lo[1], box.hi[2] - box.lo[2]});
+                constexpr float colors[][3] = {{1.0f, 0.2f, 0.2f}, {0.2f, 1.0f, 0.2f}, {0.2f, 0.55f, 1.0f}};
+                for (int a = 0; a < 3; a++) ov->add(axis_marker(*_part.axes, a, length), colors[a], to_points);
             }
             overlay = ov;
         }
@@ -404,29 +440,44 @@ void PartitionPanel::draw_controls() {
         ui::TextWrapped(pmsg::status_summary,
                         {_part.num_parts, (long long)_ds.num_cameras, (long long)_ds.points.num(),
                          cut, source_name(_part.source)->get()});
+        if (_part.axes) {
+            ui::TextDisabled(pmsg::panorama_heading, {(int)std::lround(100 * _part.axes->confidence)});
+            if (_part.axes->heading_fallback) ui::TextDisabled(pmsg::panorama_heading_fallback);
+            if (_part.axes->road_fallback) ui::TextDisabledWrapped(pmsg::panorama_road_detected);
+        }
     }
     ImGui::Spacing();
 
     ImGui::BeginDisabled(busy || !_loaded);
     // ---- options ----
+    const auto axis = spirula::PartitionMethod::AxisAligned;
     {
-        int m = _opt.method == spirula::PartitionMethod::ViewGraph ? 1 : 0;
+        int m = (int)_opt.method;
         ImGui::SetNextItemWidth(px(-80.0f));
-        if (ui::Combo(pmsg::lbl_method, &m, {&pmsg::meth_graph, &pmsg::meth_viewgraph}))
-            _opt.method = m == 1 ? spirula::PartitionMethod::ViewGraph : spirula::PartitionMethod::Graph;
-        ui::help_on_hover(pmsg::opt_method);
+        if (ui::Combo(pmsg::lbl_method, &m, {&pmsg::meth_graph, &pmsg::meth_viewgraph, &pmsg::meth_panorama}))
+            _opt.method = (spirula::PartitionMethod)m;
+        if (_opt.method != axis) ui::help_on_hover(pmsg::opt_method);
     }
     ImGui::SetNextItemWidth(px(-80.0f));
-    if (ui::Combo(pmsg::lbl_source, &_source_idx,
-                  {&pmsg::src_auto, &pmsg::src_tracks, &pmsg::src_projection, &pmsg::src_proximity}))
+    if (_opt.method == axis) {
+        if (_source_idx == 2) { _source_idx = 0; _opt.source = kSources[0]; }
+        int source = _source_idx == 3 ? 2 : _source_idx;
+        if (ui::Combo(pmsg::lbl_source, &source, {&pmsg::src_auto, &pmsg::src_tracks, &pmsg::src_proximity})) {
+            _source_idx = source == 2 ? 3 : source;
+            _opt.source = kSources[_source_idx];
+        }
+    } else if (ui::Combo(pmsg::lbl_source, &_source_idx,
+                         {&pmsg::src_auto, &pmsg::src_tracks, &pmsg::src_projection, &pmsg::src_proximity})) {
         _opt.source = kSources[std::clamp(_source_idx, 0, 3)];
-    ui::help_on_hover(pmsg::lbl_source_help);
+    }
+    if (_opt.method != axis) ui::help_on_hover(pmsg::lbl_source_help);
     if (_loaded) {
         const bool tracked = spirula::tracks_usable(_ds, _tracks);
         ui::TextDisabled(pmsg::log_dataset,
                          {(long long)_ds.num_cameras, (long long)_ds.points.num(),
                           tracked ? pmsg::word_yes.get() : pmsg::word_no.get()});
-        if (!tracked) ui::TextColoredWrapped(ImVec4(1.0f, 0.75f, 0.30f, 1.0f), pmsg::warn_no_tracks);
+        if (!tracked && _opt.method != axis)
+            ui::TextColoredWrapped(ImVec4(1.0f, 0.75f, 0.30f, 1.0f), pmsg::warn_no_tracks);
     }
 
     ui::Text(pmsg::lbl_split_by);
@@ -448,7 +499,7 @@ void PartitionPanel::draw_controls() {
     // ImGui::SetNextItemWidth(px(160.0f));
     // ui::SliderFloat(pmsg::lbl_ring, &_opt.ring_fraction, 0.0f, 0.5f, "%.2f");
     // ui::help_on_hover(pmsg::lbl_ring_help);
-    {
+    if (_opt.method != axis) {
         static const int kSeeds[] = {250000, 500000, 1000000, 2000000, 4000000};
         static const char* kSeedNames[] = {"250k", "500k", "1M", "2M", "4M"};
         int idx = 2;
@@ -458,6 +509,10 @@ void PartitionPanel::draw_controls() {
         if (ui::ComboRaw(ui::detail::label(pmsg::lbl_seeds), &idx, kSeedNames, 5))
             _opt.max_seeds = kSeeds[idx];
         ui::help_on_hover(pmsg::lbl_seeds_help);
+    } else if (ui::CollapsingHeader(spirula::i18n::msg::dataset::section_advanced)) {
+        bool force_road = _opt.panorama_route == spirula::PanoramaRoute::Road;
+        if (ui::Checkbox(pmsg::panorama_force_road, &force_road))
+            _opt.panorama_route = force_road ? spirula::PanoramaRoute::Road : spirula::PanoramaRoute::Loop;
     }
 
     const bool stale = options_changed();
@@ -470,15 +525,25 @@ void PartitionPanel::draw_controls() {
     ImGui::EndDisabled();
 
     ImGui::Separator();
-    if (_part_valid) draw_parts_table();
+    if (_part_valid && !_part.initial_frame_label.empty()) {
+        ImGui::BeginDisabled(busy);
+        ImGui::SetNextItemWidth(px(-80.0f));
+        if (ui::Combo(pmsg::view_stage, &_view_stage, {&pmsg::stage_fitted, &pmsg::stage_initial}))
+            _view_dirty = true;
+        ImGui::EndDisabled();
+    }
+    const bool initial = _view_stage == 1;
+    if (_part_valid) draw_parts_table(initial);
 
     // ---- view switches ----
-    ImGui::BeginDisabled(!_part_valid || busy);
-    if (ui::Checkbox(pmsg::show_owner_colors, &_owner_colors)) _view_dirty = true;
-    if (ui::Checkbox(pmsg::show_grid, &_show_grid)) _view_dirty = true;
-    ui::help_on_hover(pmsg::show_grid_help);
-    ui::TextDisabledWrapped(pmsg::legend);
-    ImGui::EndDisabled();
+    if (!initial) {
+        ImGui::BeginDisabled(!_part_valid || busy);
+        if (ui::Checkbox(pmsg::show_owner_colors, &_owner_colors)) _view_dirty = true;
+        if (ui::Checkbox(pmsg::show_grid, &_show_grid)) _view_dirty = true;
+        ui::help_on_hover(pmsg::show_grid_help);
+        ui::TextDisabledWrapped(pmsg::legend);
+        ImGui::EndDisabled();
+    }
 
     ImGui::Separator();
     // ---- save and queue ----
@@ -522,34 +587,46 @@ void PartitionPanel::draw_controls() {
     draw_merge();
 }
 
-void PartitionPanel::draw_parts_table() {
+void PartitionPanel::draw_parts_table(bool initial) {
+    std::vector<int> group_sizes;
+    if (initial) {
+        const auto& labels = _part.initial_frame_label;
+        group_sizes.resize((size_t)*std::max_element(labels.begin(), labels.end()) + 1);
+        for (int32_t label : labels) group_sizes[(size_t)label]++;
+    }
+    int& shown = initial ? _show_group : _show_part;
+    const int count = initial ? (int)group_sizes.size() : _part.num_parts;
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
                                   ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY;
-    const float rows = (float)std::min(_part.num_parts + 1, 9);
-    if (!ImGui::BeginTable("##parts", 4, flags,
+    const float rows = (float)std::min(count + 1, 9);
+    if (!ImGui::BeginTable(initial ? "##groups" : "##parts", initial ? 2 : 4, flags,
                            ImVec2(0, ImGui::GetFrameHeightWithSpacing() * (rows + 0.5f))))
         return;
     ImGui::TableSetupScrollFreeze(0, 1);
-    ui::TableSetupColumn(pmsg::col_part, ImGuiTableColumnFlags_WidthStretch, 1.4f);
-    ui::TableSetupColumn(pmsg::col_core, ImGuiTableColumnFlags_WidthStretch, 1.0f);
-    ui::TableSetupColumn(pmsg::col_ring, ImGuiTableColumnFlags_WidthStretch, 1.0f);
-    ui::TableSetupColumn(pmsg::col_points, ImGuiTableColumnFlags_WidthStretch, 1.3f);
+    ui::TableSetupColumn(initial ? pmsg::col_group : pmsg::col_part, ImGuiTableColumnFlags_WidthStretch, 1.4f);
+    ui::TableSetupColumn(initial ? gmsg::viewport_cameras : pmsg::col_core, ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    if (!initial) {
+        ui::TableSetupColumn(pmsg::col_ring, ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ui::TableSetupColumn(pmsg::col_points, ImGuiTableColumnFlags_WidthStretch, 1.3f);
+    }
     ImGui::TableHeadersRow();
 
     ImGui::TableNextRow();
     ImGui::TableNextColumn();
-    if (ui::Selectable(pmsg::show_all_parts, _show_part < 0)) {
-        _show_part = -1;
+    if (ui::Selectable(initial ? pmsg::show_all_groups : pmsg::show_all_parts, shown < 0)) {
+        shown = -1;
         _view_dirty = true;
     }
-    ui::help_on_hover(pmsg::show_help);
+    if (!initial) ui::help_on_hover(pmsg::show_help);
     ImGui::TableNextColumn();
     ui::TextRaw(std::to_string(_part.frame_names.size()));
-    ImGui::TableNextColumn();
-    ImGui::TableNextColumn();
-    ui::TextRaw(std::to_string(_part.point_label.size()));
+    if (!initial) {
+        ImGui::TableNextColumn();
+        ImGui::TableNextColumn();
+        ui::TextRaw(std::to_string(_part.point_label.size()));
+    }
 
-    for (int k = 0; k < _part.num_parts; k++) {
+    for (int k = 0; k < count; k++) {
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::PushID(k);
@@ -560,17 +637,19 @@ void PartitionPanel::draw_parts_table() {
             ImGui::GetColorU32(part_vec(k)), 2.0f);
         ImGui::Dummy(ImVec2(h, h));
         ImGui::SameLine();
-        if (ui::SelectableRaw(std::to_string(k), _show_part == k)) {
-            _show_part = _show_part == k ? -1 : k;
+        if (ui::SelectableRaw(std::to_string(k), shown == k)) {
+            shown = shown == k ? -1 : k;
             _view_dirty = true;
         }
         ImGui::PopID();
         ImGui::TableNextColumn();
-        ui::TextRaw(std::to_string(_part.core_count(k)));
-        ImGui::TableNextColumn();
-        ui::TextRaw(std::to_string(_part.ring[(size_t)k].size()));
-        ImGui::TableNextColumn();
-        ui::TextRaw(std::to_string(_part.part_points[(size_t)k].size()));
+        ui::TextRaw(std::to_string(initial ? group_sizes[(size_t)k] : _part.core_count(k)));
+        if (!initial) {
+            ImGui::TableNextColumn();
+            ui::TextRaw(std::to_string(_part.ring[(size_t)k].size()));
+            ImGui::TableNextColumn();
+            ui::TextRaw(std::to_string(_part.part_points[(size_t)k].size()));
+        }
     }
     ImGui::EndTable();
 }

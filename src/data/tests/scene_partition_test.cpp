@@ -109,6 +109,241 @@ void write_text(const fs::path& p, const std::string& s) {
     f << s;
 }
 
+void panorama_tests(const fs::path& tmp) {
+    using namespace spirula;
+    Corridor road = make_corridor(18, 24, 5, 3.5);
+    std::fill(road.ds.camera_models.begin(), road.ds.camera_models.end(), 3);
+    road.ds.gauge_oriented = true;
+    const double cosine = std::cos(0.61), sine = std::sin(0.61);
+    auto rotate = [&](double x, double y) { return std::array<double, 2>{cosine * x - sine * y, sine * x + cosine * y}; };
+    road.ds.center = {100.0, 150.0, 20.0};
+    for (int64_t i = 0; i < road.ds.num_cameras; i++) {
+        auto q = rotate((double)i, i % 2 ? 0.5 : -0.5);
+        road.ds.c2w[i * 12 + 3] = (float)q[0];
+        road.ds.c2w[i * 12 + 7] = (float)q[1];
+    }
+    for (int64_t i = 0; i < road.ds.points.num(); i++) {
+        auto q = rotate(road.ds.points.xyz[i * 3], road.ds.points.xyz[i * 3 + 1]);
+        road.ds.points.xyz[i * 3] = q[0];
+        road.ds.points.xyz[i * 3 + 1] = q[1];
+    }
+    PartitionOptions opt;
+    opt.method = PartitionMethod::AxisAligned;
+    opt.parts = 2;
+    opt.ring_min_points = 1;
+    opt.outside_seed_fraction = 0;
+    const auto cov = build_covisibility(road.ds, &road.tracks, opt);
+    const auto p = partition_scene(road.ds, cov, opt);
+    graph::LabelCutOptions group_options;
+    group_options.parts = opt.parts;
+    group_options.min_part = group_options.min_final = 1;
+    check(p.initial_frame_label == graph::cut_labels(cov.cameras, group_options),
+          "preview labels come from the initial covisibility cut");
+    check(p.axes && p.num_parts == 2 && label_changes(p.frame_label) == 1 && p.axes->splits[0].axis == 0 &&
+              std::abs(p.axes->basis[0][0] * cosine + p.axes->basis[0][1] * sine) > 0.999,
+          "rotated panorama road recovers the overall axis despite zigzagging stations");
+    check(!p.ring[0].empty() && !p.ring[1].empty(), "road borrows panoramas across the cut");
+    PartitionOptions adaptive_opt = opt;
+    adaptive_opt.panorama_route = PanoramaRoute::Loop;
+    const auto adaptive = partition_scene(road.ds, cov, adaptive_opt);
+    check(adaptive.axes && adaptive.axes->road_fallback && adaptive.axes->basis == p.axes->basis &&
+              adaptive.initial_frame_label == p.initial_frame_label && adaptive.frame_label == p.frame_label &&
+              adaptive.point_label == p.point_label,
+          "loop mode cuts a nearly linear trajectory across the road");
+    const auto path = (tmp / "panorama.json").string();
+    write_partition(adaptive, path, "panorama");
+    const auto back = read_partition(path);
+    check(back.axes && back.axes->road_fallback && back.axes->basis == p.axes->basis &&
+              back.axes->splits[0].cut == p.axes->splits[0].cut &&
+              back.part_points == p.part_points && back.ring == p.ring, "panorama geometry and tables round-trip");
+
+    bool consistent = true;
+    std::vector<std::string> paths;
+    for (int k = 0; k < back.num_parts; k++) {
+        auto region = back.region(k);
+        RegionProgram program;
+        std::string error;
+        const double shift[] = {-200, -300, -40};
+        consistent &= compile_region(*region, program, error, 2.0, shift);
+        auto data = road.ds;
+        PartitionApplied applied;
+        consistent &= apply_partition(data, back, k, applied) &&
+                      applied.frames_after == (int64_t)back.frames_of(k).size() &&
+                      applied.points_after == (int64_t)back.part_points[k].size();
+        auto cloud = splats_along_x(0, 1, 2, 0, (float)k);
+        for (int s = 0; s < 2; s++) {
+            const int image = s ? 17 : 0;
+            for (int a = 0; a < 3; a++) cloud.means[s * 3 + a] = back.frame_centers[image * 3 + a];
+        }
+        paths.push_back((tmp / ("panorama_" + std::to_string(k) + ".ply")).string());
+        write_splat_ply(cloud, paths.back());
+        const auto frames = back.frames_of(k);
+        for (size_t i = 0; i < back.point_label.size(); i++) {
+            double source[3], train[3];
+            for (int a = 0; a < 3; a++) {
+                train[a] = 2 * road.ds.points.xyz[i * 3 + a];
+                source[a] = road.ds.points.xyz[i * 3 + a] + road.ds.center[a];
+            }
+            const bool own = back.point_label[i] == k;
+            if (std::abs(back.axes->basis[0][0] * source[0] + back.axes->basis[0][1] * source[1] - back.axes->splits[0].cut) > 1e-4)
+                consistent &= program_contains(program, train) == own;
+            consistent &= region->contains(source) == own;
+            bool observed = false;
+            for (int64_t j = cov.beg[i]; j < cov.beg[i + 1]; j++)
+                observed |= std::binary_search(frames.begin(), frames.end(), cov.frame[j]);
+            consistent &= std::binary_search(back.part_points[k].begin(), back.part_points[k].end(), (int64_t)i) == (observed && own);
+        }
+    }
+    check(consistent, "point ownership, training ROI and visible owned seed lists agree");
+    MergeStats merged_stats;
+    const auto merged = merge_partition_splats(back, paths, merged_stats);
+    check(merged.num == 2 && merged_stats.parts[0].kept == 1 && merged_stats.parts[1].kept == 1,
+          "axis-aligned merge retains each model's own side");
+
+    Corridor loop = make_corridor(32, 1, 1);
+    std::fill(loop.ds.camera_models.begin(), loop.ds.camera_models.end(), 3);
+    loop.tracks.track_image.clear();
+    loop.tracks.track_beg.assign(1, 0);
+    for (int i = 0; i < 32; i++) {
+        const int j = (i + 3) % 32;
+        const double t = -4 + j % 8;
+        const double x[] = {t, 4, -t, -4}, y[] = {-4, t, 4, -t};
+        const auto q = rotate(x[j / 8], y[j / 8]);
+        loop.ds.c2w[i * 12 + 3] = (float)q[0];
+        loop.ds.c2w[i * 12 + 7] = (float)q[1];
+        loop.ds.points.xyz[i * 3] = q[0] * 0.8;
+        loop.ds.points.xyz[i * 3 + 1] = q[1] * 0.8;
+        for (int d = -2; d <= 2; d++) loop.tracks.track_image.push_back((i + d + 32) % 32);
+        loop.tracks.track_beg.push_back((int64_t)loop.tracks.track_image.size());
+    }
+    opt.panorama_route = PanoramaRoute::Loop;
+    opt.parts = 4;
+    const auto loop_cov = build_covisibility(loop.ds, &loop.tracks, opt);
+    const auto loop_part = partition_scene(loop.ds, loop_cov, opt);
+    const auto& labels = loop_part.frame_label;
+    const bool one_arc = label_changes(labels) + (labels.front() != labels.back()) == 4;
+    check(loop_part.num_parts == 4 && one_arc && !loop_part.axes->road_fallback &&
+              loop_part.axes->up_source == "trajectory" &&
+              std::abs(loop_part.axes->basis[0][0] * cosine + loop_part.axes->basis[0][1] * sine) > 0.99,
+          "rotated building loop recovers axes and keeps each part on one cyclic arc");
+
+    ParsedDataset repeat;
+    repeat.num_cameras = 64;
+    repeat.gauge_oriented = true;
+    const auto drift = rotate(0.07, 0.07);
+    for (int i = 31; i >= 0; i--) {
+        for (int clip : {1, 0}) {
+            const float* pose = &loop.ds.c2w[i * 12];
+            const size_t offset = repeat.c2w.size();
+            repeat.c2w.insert(repeat.c2w.end(), pose, pose + 12);
+            repeat.c2w[offset + 3] += (float)(clip * drift[0]);
+            repeat.c2w[offset + 7] += (float)(clip * drift[1]);
+            repeat.camera_models.push_back(3);
+            repeat.image_filenames.push_back("/loop/clip" + std::to_string(clip) + "/frame_" + std::to_string(i) + ".jpg");
+        }
+    }
+    const auto repeated = partition_scene(repeat, build_covisibility(repeat, nullptr, opt), opt);
+    const auto& axes = *repeated.axes;
+    const auto along_wall = [&](int a) { return std::abs(axes.basis[a][0] * cosine + axes.basis[a][1] * sine); };
+    check(!axes.heading_fallback && std::max(along_wall(0), along_wall(1)) > 0.999,
+          "loop follows numbered frames within each clip despite closer stations in another lap");
+
+    Corridor rig = make_corridor(12, 16, 9);
+    std::fill(rig.ds.camera_models.begin(), rig.ds.camera_models.end(), 1);
+    const fs::path model = tmp / "native_rig" / "sparse" / "0";
+    fs::create_directories(model);
+    write_text(model / "cameras.txt", "1 OPENCV_FISHEYE 500 500 250 250 250 250 0 0 0 0\n");
+    write_text(model / "rigs.txt", "# Rig calibration from spirula sfm, cam_from_rig per member as\n"
+               "rig cam0 cam0 1 0 0 0 0 0 0 0 0\nrig cam1 cam0 0 0 1 0 0 0 0 0 0\n");
+    std::string image_rows;
+    for (int i = 0; i < 12; i++) {
+        const std::string name = "cam" + std::to_string(i % 2) + "/" + std::to_string(10000 + i / 2) + ".jpg";
+        rig.ds.image_filenames[i] = "/nowhere/" + name;
+        image_rows += std::to_string(i + 1) + " 1 0 0 0 0 0 0 1 " + name + "\n\n";
+    }
+    write_text(model / "images.txt", image_rows);
+    {
+        std::ofstream point_rows(model / "points3D.txt");
+        for (int64_t i = 0; i < rig.ds.points.num(); i++) {
+            point_rows << i + 1 << " 0 0 0 128 128 128 0.5";
+            for (int64_t j = rig.tracks.track_beg[i]; j < rig.tracks.track_beg[i + 1]; j++)
+                point_rows << ' ' << rig.tracks.track_image[j] + 1 << " 0";
+            point_rows << '\n';
+        }
+    }
+    const auto native_tracks = read_sparse_stats((tmp / "native_rig").string(), true);
+    check(native_tracks.image_rig_frame == std::vector<int32_t>{0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5},
+          "native rigs.txt resolves synchronized dual fisheye stations");
+    opt.panorama_route = PanoramaRoute::Road;
+    opt.parts = 0;
+    opt.max_images = 6;
+    const auto rig_cov = build_covisibility(rig.ds, &native_tracks, opt);
+    const auto rig_part = partition_scene(rig.ds, rig_cov, opt);
+    bool whole = rig_cov.cameras.n() == 6;
+    for (int k = 0; k < rig_part.num_parts; k++) {
+        const auto frames = rig_part.frames_of(k);
+        whole &= frames.size() <= 6 && frames.size() % 2 == 0;
+        for (size_t i = 0; i + 1 < frames.size(); i += 2)
+            whole &= frames[i] % 2 == 0 && frames[i + 1] == frames[i] + 1;
+    }
+    check(whole, "split panoramas stay together in core and ring under the image cap");
+
+    Corridor gain = make_corridor(3, 1, 3);
+    std::fill(gain.ds.camera_models.begin(), gain.ds.camera_models.end(), 3);
+    gain.ds.points.xyz = {0.1, 0, 0, 0.2, 0, 0, 2.2, 0, 0};
+    gain.tracks.track_beg = {0, 2, 3, 4};
+    gain.tracks.track_image = {0, 1, 2, 2};
+    opt.max_images = 2;
+    opt.ring_fraction = 0;
+    const auto gain_part = partition_scene(gain.ds, build_covisibility(gain.ds, &gain.tracks, opt), opt);
+    check(gain_part.ring[gain_part.frame_label[0]] == std::vector<int32_t>{2},
+          "budgeted ring prefers a new owned point over repeated coverage");
+
+    Corridor distant = make_corridor(2, 2, 5);
+    std::fill(distant.ds.camera_models.begin(), distant.ds.camera_models.end(), 3);
+    distant.ds.c2w[11] = distant.ds.c2w[23] = 0;
+    distant.ds.c2w[15] = 20;
+    distant.ds.points.xyz = {0.1, 0, 0, 1, 0, 0, 1.2, 0, 0, 19.9, 0, 0};
+    distant.tracks.track_beg = {0, 2, 3, 4, 5};
+    distant.tracks.track_image = {0, 1, 1, 1, 1};
+    PartitionOptions distant_opt = opt;
+    distant_opt.parts = 2;
+    distant_opt.ring_fraction = 0.1f;
+    distant_opt.ring_min_points = 2;
+    const auto distant_cov = build_covisibility(distant.ds, &distant.tracks, distant_opt);
+    const auto distant_part = partition_scene(distant.ds, distant_cov, distant_opt);
+    check(distant_part.ring[distant_part.frame_label[0]] == std::vector<int32_t>{1},
+          "a low-share station can cover previously unseen owned points");
+    distant_opt.ring_min_points = 3;
+    const auto below_gain = partition_scene(distant.ds, distant_cov, distant_opt);
+    check(below_gain.ring[below_gain.frame_label[0]].empty(), "coverage threshold counts only newly seen points");
+    distant_opt.ring_min_points = 2;
+    distant_opt.max_images = 1;
+    const auto full = partition_scene(distant.ds, distant_cov, distant_opt);
+    check(full.ring[full.frame_label[0]].empty(), "coverage stations fit within the remaining image budget");
+
+    Corridor coverage = make_corridor(6, 1, 1);
+    std::fill(coverage.ds.camera_models.begin(), coverage.ds.camera_models.end(), 3);
+    coverage.ds.points.xyz = {2.7, 1, 0};
+    coverage.ds.points.rgb = {128, 128, 128};
+    coverage.tracks.track_beg = {0, 1};
+    coverage.tracks.track_image = {2};
+    opt.parts = 2;
+    const auto cover = partition_scene(coverage.ds, build_covisibility(coverage.ds, &coverage.tracks, opt), opt);
+    check(cover.point_label[0] == cover.frame_label[2], "cut score keeps a surface with its only core observer");
+    const auto proximity = build_covisibility(coverage.ds, nullptr, opt);
+    check(proximity.source == CovisibilitySource::Proximity && !proximity.has_tracks() &&
+              partition_scene(coverage.ds, proximity, opt).num_parts == 2,
+          "pose-only panoramas use station proximity");
+
+    ScenePartition::Axes axis;
+    axis.basis = {{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+    axis.splits.push_back({0, 2, ~0, ~1});
+    const double seam[] = {2, 1, 0};
+    check(axis.owner(seam) == 1 && axis.region(1)->contains(seam) && !axis.region(0)->contains(seam),
+          "shared plane belongs exactly to the high side");
+}
+
 }  // namespace
 
 int main() {
@@ -287,6 +522,7 @@ int main() {
     std::error_code ec;
     fs::remove_all(tmp, ec);
     fs::create_directories(tmp / "dataset", ec);
+    panorama_tests(tmp);
     const std::string json = (tmp / "dataset" / "partition.json").string();
     write_partition(p, json, (tmp / "dataset").string());
     {

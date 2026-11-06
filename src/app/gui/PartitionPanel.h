@@ -51,7 +51,7 @@ private:
     void poll();
     void refresh_view();
     void draw_controls();
-    void draw_parts_table();
+    void draw_parts_table(bool initial);
     void draw_merge();
     bool options_changed() const;
 
@@ -95,7 +95,9 @@ private:
     // ---- the view ----
     ViewportPanel _view;
     bool _view_dirty = false;
+    int _view_stage = 0;
     int _show_part = -1;   // -1: every part
+    int _show_group = -1;
     bool _owner_colors = true;
     bool _show_grid = true;
     bool _gl_ok = true;

@@ -77,12 +77,14 @@ struct SparseStats {
     std::vector<int64_t> track_beg;
     std::vector<int32_t> track_image;
     std::vector<std::string> image_names;
+    std::vector<int32_t> image_rig_frame;  // -1 for images absent from the COLMAP frame table.
+    std::vector<std::array<double, 3>> rig_centers;
     std::vector<int32_t> image_points;     // 2D features that became 3D points
     bool empty() const { return track_beg.empty(); }
 };
 
 // Empty for anything that is not a COLMAP model.
-SparseStats read_sparse_stats(const std::string& dataset_dir);
+SparseStats read_sparse_stats(const std::string& dataset_dir, bool include_rig_frames = false);
 
 // A plain point cloud, for anything that has no reconstruction behind it.
 enum class PlyCoordinates { Float32, Float64 };

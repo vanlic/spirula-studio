@@ -50,9 +50,11 @@ void usage() {
     std::fprintf(stderr, "\n%s\n", P::head_split.get());
     help_row("--parts <n>", P::opt_parts);
     help_row("--max-images <n>", P::opt_max_images);
-    help_row("--method graph|viewgraph", P::opt_method);
+    help_row("--method graph|viewgraph|axis-aligned", P::opt_method);
+    help_row("--route road|loop", P::opt_panorama_route);
     help_row("--ring <fraction>", P::opt_ring);
     help_row("--ring-min-points <n>", P::opt_ring_min);
+    help_row("--outside-seed-fraction <f>", P::opt_outside_seeds);
     help_row("--max-seeds <n>", P::opt_max_seeds);
     help_row("--source auto|tracks|projection|proximity", P::opt_source);
     help_row("-o, --output <file>", P::opt_output);
@@ -85,10 +87,14 @@ int run_split(int argc, char** argv) {
         else if (a == "--max-images") opt.max_images = std::atoi(next());
         else if (a == "--ring") opt.ring_fraction = (float)std::atof(next());
         else if (a == "--ring-min-points") opt.ring_min_points = std::atoi(next());
+        else if (a == "--outside-seed-fraction") opt.outside_seed_fraction = (float)std::atof(next());
         else if (a == "--max-seeds") opt.max_seeds = std::atoi(next());
         else if (a == "--method") {
             const char* v = next();
             if (!spirula::partition_method_from_name(v, opt.method)) return bad_value(v, "--method");
+        } else if (a == "--route") {
+            const char* v = next();
+            if (!spirula::panorama_route_from_name(v, opt.panorama_route)) return bad_value(v, "--route");
         }
         else if (a == "--source") {
             const char* v = next();
@@ -108,12 +114,15 @@ int run_split(int argc, char** argv) {
     if (opt.parts < 0 || opt.max_images < 1 || opt.max_seeds < 1000 || opt.ring_fraction < 0)
         return bad_value("", opt.parts < 0 ? "--parts" : opt.max_images < 1 ? "--max-images"
                                           : opt.max_seeds < 1000 ? "--max-seeds" : "--ring");
+    if (!(opt.outside_seed_fraction >= 0 && opt.outside_seed_fraction <= 1))
+        return bad_value("", "--outside-seed-fraction");
 
     std::printf("%s\n", format(P::log_reading, {dataset}).c_str());
     DatasetParserConfig dcfg;
     dcfg.require_image_files = false;
     const ParsedDataset ds = parse_dataset(dataset, dcfg, "");
-    const spirula::SparseStats tracks = spirula::read_sparse_stats(dataset);
+    const bool axis_aligned = opt.method == spirula::PartitionMethod::AxisAligned;
+    const spirula::SparseStats tracks = spirula::read_sparse_stats(dataset, axis_aligned);
     std::printf("%s\n", format(P::log_dataset,
                                {(long long)ds.num_cameras, (long long)ds.points.num(),
                                 tracks.empty() ? P::word_no.get() : P::word_yes.get()}).c_str());
@@ -123,17 +132,20 @@ int run_split(int argc, char** argv) {
     std::printf("%s\n", format(P::log_covisibility,
                                {spirula::covisibility_source_name(cov.source),
                                 (long long)(cov.cameras.adj.size() / 2)}).c_str());
-    const spirula::ScenePartition part = spirula::partition_scene(ds, cov, opt);
-    char cut[32];
-    std::snprintf(cut, sizeof cut, "%.1f", 100.0 * part.cut_fraction);
-    std::printf("%s\n", format(P::log_summary, {part.num_parts, cut,
-                                                 (long long)(part.field ? part.field->num_seeds() : 0)}).c_str());
+    const auto part = spirula::partition_scene(ds, cov, opt, axis_aligned ? spirula::PartitionLog(log) : spirula::PartitionLog{});
+    if (!axis_aligned) {
+        char cut[32];
+        std::snprintf(cut, sizeof cut, "%.1f", 100.0 * part.cut_fraction);
+        std::printf("%s\n", format(P::log_summary, {part.num_parts, cut,
+                                                     (long long)(part.field ? part.field->num_seeds() : 0)}).c_str());
+    }
     for (int k = 0; k < part.num_parts; k++) {
-        std::printf("%s\n", format(P::log_part, {k, (long long)part.core_count(k),
-                                                 (long long)part.ring[(size_t)k].size(),
-                                                 (long long)part.part_points[(size_t)k].size(),
-                                                 (long long)std::lround(100.0 * part.view_share[(size_t)k])})
-                                .c_str());
+        if (!axis_aligned)
+            std::printf("%s\n", format(P::log_part, {k, (long long)part.core_count(k),
+                                                     (long long)part.ring[(size_t)k].size(),
+                                                     (long long)part.part_points[(size_t)k].size(),
+                                                     (long long)std::lround(100.0 * part.view_share[(size_t)k])})
+                                    .c_str());
         if (part.core_pieces[(size_t)k] > 1)
             std::printf("%s\n", format(P::log_part_pieces, {k, part.core_pieces[(size_t)k]}).c_str());
     }

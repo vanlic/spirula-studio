@@ -10,6 +10,9 @@ into one model. The code is portable host code in `data/ScenePartition.h`,
 hooks are `--partition` / `--partition-part` and `--roi-region`
 (`TrainerSession::apply_partition_config`, `setup_region`).
 
+The `axis-aligned` method splits 360° captures along a straight road or
+around one building. See [panorama partitioning](axis-aligned-scene-partition.md).
+
 ## Why not Voronoi over the cameras
 
 The obvious split -- k-means on positions, Voronoi cells, crop by cell at the

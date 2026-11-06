@@ -37,6 +37,7 @@
 #include "sfm/core/Events.h"
 #include "sfm/core/Exif.h"
 #include "sfm/core/Progress.h"
+#include "sfm/core/RigFile.h"
 #include "sfm/core/CameraSetup.h"
 #include "sfm/core/FeatureCompaction.h"
 #include "sfm/core/Log.h"
@@ -1057,56 +1058,14 @@ void writeRigs(const fs::path& dir, const Reconstruction& m, const RigTable* rig
 }
 
 RigTable readRigs(const fs::path& dir, Reconstruction& m) {
-    std::ifstream f(dir / "rigs.txt");
+    const fs::path path = dir / "rigs.txt";
+    std::ifstream f(path);
     if (!f) return {};
-    struct Row {
-        std::string member, ref;
-        Quat q;
-        Vec3 t;
-        uint32_t frames = 0;
-        double spread = 0;
-    };
-    std::vector<std::string> order;
-    std::map<std::string, std::vector<Row>> rows;
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.empty() || line[0] == '#') continue;
-        std::istringstream ss(line);
-        std::string rig;
-        Row r;
-        if (!(ss >> rig >> r.member >> r.ref >> r.q[0] >> r.q[1] >> r.q[2] >> r.q[3] >> r.t.x >>
-              r.t.y >> r.t.z))
-            throw std::runtime_error((dir / "rigs.txt").string() + ": cannot read '" + line + "'");
-        ss >> r.frames >> r.spread;
-        if (!rows.count(rig)) order.push_back(rig);
-        rows[rig].push_back(r);
-    }
-    std::vector<RigDef> defs;
-    for (const std::string& name : order) {
-        RigDef d;
-        d.name = name;
-        for (const Row& r : rows[name]) d.members.push_back({r.member});
-        defs.push_back(std::move(d));
-    }
     uint32_t n = 0;
     for (const auto& kv : m.images) n = std::max(n, kv.first + 1);
     std::vector<std::string> names(n);
     for (const auto& kv : m.images) names[kv.first] = kv.second.name;
-    RigTable rigs = buildRigTable(names, defs);
-    m.rigs.assign(rigs.rigs.size(), RigCalib{});
-    for (size_t r = 0; r < order.size(); r++) {
-        const std::vector<Row>& rs = rows[order[r]];
-        RigCalib& c = m.rigs[r];
-        c.resize(rs.size());
-        for (size_t k = 0; k < rs.size(); k++) {
-            c.cam_from_rig[k] = {quaternionToRotation(rs[k].q), rs[k].t};
-            c.established[k] = 1;
-            c.support[k] = rs[k].frames;
-            c.spread_deg[k] = rs[k].spread;
-            if (rs[k].member == rs[k].ref) c.ref = (int)k;
-        }
-    }
-    return rigs;
+    return readRigCalibration(f, path.string(), names, m.rigs);
 }
 
 // Every reconstruction as <dir>/0, <dir>/1, ... (D41) -- COLMAP's layout for a

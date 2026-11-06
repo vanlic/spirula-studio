@@ -87,16 +87,15 @@ SplatCloud merge_partition_splats(const ScenePartition& p, const std::vector<std
             for (int i = 0; i < 3; i++) S.t[i] = W.t[i];
             if (!S.is_identity()) transform_splats(c, S);
         }
-        // Each splat's short axis, pointed at the nearest of the cameras that
-        // trained it, decides which side of a surface it is: the wall's back,
-        // seen only from the next room, stays with that room's model.
+        // The label field uses the normal to distinguish opposite faces of a wall.
         std::vector<float> cam_xyz;
         std::vector<int32_t> cam_idx;
-        for (int32_t f : p.frames_of(k)) {
-            cam_xyz.insert(cam_xyz.end(), p.frame_centers.begin() + (size_t)f * 3,
-                           p.frame_centers.begin() + (size_t)f * 3 + 3);
-            cam_idx.push_back((int32_t)cam_idx.size());
-        }
+        if (p.field)
+            for (int32_t f : p.frames_of(k)) {
+                cam_xyz.insert(cam_xyz.end(), p.frame_centers.begin() + (size_t)f * 3,
+                               p.frame_centers.begin() + (size_t)f * 3 + 3);
+                cam_idx.push_back((int32_t)cam_idx.size());
+            }
         LabelField cams;
         if (!cam_xyz.empty())
             cams = LabelField::build(cam_xyz.data(), cam_idx.data(), nullptr, (int64_t)cam_idx.size(), 4);
@@ -105,6 +104,10 @@ SplatCloud merge_partition_splats(const ScenePartition& p, const std::vector<std
 #pragma omp parallel for schedule(static)
         for (int64_t i = 0; i < c.num; i++) {
             const double q[3] = {c.means[(size_t)i * 3], c.means[(size_t)i * 3 + 1], c.means[(size_t)i * 3 + 2]};
+            if (p.axes) {
+                keep[(size_t)i] = p.axes->owner(q) == k;
+                continue;
+            }
             double n[3];
             const double* np = nullptr;
             if (!cams.empty()) {
