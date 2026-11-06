@@ -133,6 +133,10 @@ void visit_partition_splats(const ScenePartition& p, const std::vector<std::stri
             for (int64_t i = 0; i < c.num; i++) {
                 const float* qf = c.means.data() + (size_t)i * 3;
                 const double q[3] = {qf[0], qf[1], qf[2]};
+                if (p.axes) {
+                    keep[(size_t)i] = p.axes->owner(q) == k;
+                    continue;
+                }
                 double normal[3];
                 const double* np = nullptr;
                 const float* query_point = frame.cameras ? input.means.data() + (size_t)i * 3 : qf;

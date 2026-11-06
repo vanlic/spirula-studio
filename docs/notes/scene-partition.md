@@ -10,6 +10,9 @@ into one model. The code is portable host code in `data/ScenePartition.h`,
 hooks are `--partition` / `--partition-part` and `--roi-region`
 (`TrainerSession::apply_partition_config`, `setup_region`).
 
+The `axis-aligned` method splits 360° captures along a straight road or
+around one building. See [panorama partitioning](axis-aligned-scene-partition.md).
+
 ## Choosing a partition
 
 The default is `--method viewgraph`. `--method graph` cuts the joint
