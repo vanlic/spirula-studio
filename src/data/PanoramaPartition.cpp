@@ -1,8 +1,9 @@
 #include "data/PanoramaPartition.h"
 
 #include "data/Knn.h"
+#include "data/PanoramaPartitionGeometry.h"
+#include "data/PanoramaPartitionRefine.h"
 #include "data/PartitionVisibility.h"
-#include "sfm/geometry/LinAlg.h"
 
 #include <algorithm>
 #include <charconv>
@@ -20,19 +21,15 @@
 namespace spirula {
 namespace {
 
-using Vec = std::array<double, 3>;
+using panorama::Vec;
+using panorama::as_vec;
+using panorama::median;
+using panorama::project;
+using panorama::source_point;
+using panorama::stop_if;
 using sfm::Vec3;
 
-double project(const Vec& axis, const double* p) {
-    return axis[0] * p[0] + axis[1] * p[1] + axis[2] * p[2];
-}
-
 Vec as_array(Vec3 v) { return {v.x, v.y, v.z}; }
-Vec3 as_vec(const Vec& v) { return {v[0], v[1], v[2]}; }
-
-void stop_if(const std::atomic<bool>* cancel) {
-    if (graph::cancelled(cancel)) throw PartitionCancelled();
-}
 
 struct Station {
     Vec center{};
@@ -70,13 +67,6 @@ std::vector<float> local_centers(const std::vector<Station>& stations, const Vec
     for (const Station& s : stations)
         for (int a = 0; a < 3; a++) xyz.push_back((float)(s.center[a] - origin[a]));
     return xyz;
-}
-
-double median(std::vector<double>& values) {
-    if (values.empty()) return 0;
-    auto mid = values.begin() + values.size() / 2;
-    std::nth_element(values.begin(), mid, values.end());
-    return *mid;
 }
 
 Vec3 loop_normal(const std::vector<Station>& stations, const Vec& origin, Vec3 reference) {
@@ -124,10 +114,15 @@ Heading road_heading(const std::vector<Station>& stations, const Vec& origin, Ve
     return {0.5 * std::atan2(2 * xy, xx - yy), std::min(1.0, std::hypot(xx - yy, 2 * xy) / trace)};
 }
 
-std::set<std::vector<size_t>> capture_sequences(const ParsedDataset& ds, const std::vector<Station>& stations) {
+using CaptureSequences = std::set<std::vector<size_t>>;
+
+CaptureSequences capture_sequences(const ParsedDataset& ds, const std::vector<Station>& stations,
+                                   const std::atomic<bool>* cancel) {
+    if (ds.image_filenames.size() != (size_t)ds.num_cameras) return {};
     using NumberedFrame = std::pair<uint64_t, size_t>;
     std::map<std::pair<std::filesystem::path, std::string>, std::vector<NumberedFrame>> groups;
     for (size_t i = 0; i < stations.size(); i++) {
+        if (i % 1024 == 0) stop_if(cancel);
         for (int32_t frame : stations[i].frames) {
             const auto path = std::filesystem::u8path(ds.image_filenames[(size_t)frame]);
             const std::string stem = path.stem().u8string();
@@ -139,23 +134,94 @@ std::set<std::vector<size_t>> capture_sequences(const ParsedDataset& ds, const s
                 groups[{path.parent_path(), stem.substr(0, digits)}].emplace_back(number, i);
         }
     }
-    std::set<std::vector<size_t>> sequences;
+    CaptureSequences sequences;
     for (auto& entry : groups) {
         auto& frames = entry.second;
         std::sort(frames.begin(), frames.end());
         frames.erase(std::unique(frames.begin(), frames.end()), frames.end());
         if (frames.size() < 3 || std::adjacent_find(frames.begin(), frames.end(),
                 [](const auto& a, const auto& b) { return a.first == b.first; }) != frames.end()) continue;
-        std::vector<size_t> sequence;
-        for (const auto& frame : frames) sequence.push_back(frame.second);
-        sequences.insert(std::move(sequence));
+        std::set<size_t> unique_stations;
+        std::vector<double> strides;
+        for (size_t i = 0; i < frames.size(); i++) {
+            unique_stations.insert(frames[i].second);
+            if (i > 0) strides.push_back((double)(frames[i].first - frames[i - 1].first));
+        }
+        if (unique_stations.size() != frames.size()) continue;
+        const double gap = 8 * median(strides);
+        std::vector<size_t> sequence{frames.front().second};
+        for (size_t i = 1; i < frames.size(); i++) {
+            if ((double)(frames[i].first - frames[i - 1].first) > gap) {
+                if (sequence.size() >= 3) sequences.insert(std::move(sequence));
+                sequence.clear();
+            }
+            sequence.push_back(frames[i].second);
+        }
+        if (sequence.size() >= 3) sequences.insert(std::move(sequence));
     }
     return sequences;
 }
 
-Heading loop_heading(const ParsedDataset& ds, const std::vector<Station>& stations, const Vec& origin,
+struct CapturePath {
+    std::vector<Vec3> steps;
+    double spacing = 0;
+
+    Vec3 chord(int first, int stride, bool closed) const {
+        const int n = (int)steps.size();
+        Vec3 sum{};
+        for (int k = 0; k < 3; k++, first += stride) {
+            if (!closed && (first < 0 || first >= n)) break;
+            const Vec3 step = steps[(first + n) % n];
+            if (step.norm() > 4 * spacing) break;
+            sum = sum + step;
+        }
+        return sum;
+    }
+};
+
+template <typename Displacement>
+CapturePath capture_path(const std::vector<size_t>& sequence, Displacement displacement) {
+    CapturePath path;
+    std::vector<double> distances;
+    for (size_t i = 1; i < sequence.size(); i++) {
+        path.steps.push_back(displacement(sequence[i - 1], sequence[i]));
+        const double distance = path.steps.back().norm();
+        if (distance > 0) distances.push_back(distance);
+    }
+    path.spacing = median(distances);
+    return path;
+}
+
+bool has_fold(const CaptureSequences& sequences, const std::vector<Station>& stations, Vec3 u, Vec3 v,
+              const std::atomic<bool>* cancel) {
+    auto displacement = [&](size_t a, size_t b) {
+        const Vec3 d = as_vec(stations[b].center) - as_vec(stations[a].center);
+        return Vec3{d.dot(u), d.dot(v), 0};
+    };
+    for (const auto& sequence : sequences) {
+        const auto path = capture_path(sequence, displacement);
+        if (path.spacing <= 0) continue;
+        const double min_leg = 2 * path.spacing;
+        const int n = (int)path.steps.size();
+        for (int i = 2; i + 3 < n; i++) {
+            if (i % 1024 == 0) stop_if(cancel);
+            const Vec3 before = path.chord(i, -1, false);
+            if (std::abs(before.x) < min_leg || std::abs(before.x) < 0.9 * before.norm()) continue;
+            for (int j = i + 1; j < std::min(n - 2, i + 9); j++) {
+                if (path.steps[j - 1].norm() > 4 * path.spacing) break;
+                const Vec3 after = path.chord(j, 1, false);
+                if (before.x * after.x >= 0 || std::abs(after.x) < min_leg ||
+                    std::abs(after.x) < 0.9 * after.norm()) continue;
+                const Vec3 separation = displacement(sequence[i + 1], sequence[j]) + (before + after) * 0.5;
+                if (std::abs(separation.y) >= min_leg) return true;
+            }
+        }
+    }
+    return false;
+}
+
+Heading loop_heading(const CaptureSequences& sequences, const std::vector<Station>& stations, const Vec& origin,
                      Vec3 u, Vec3 v, const std::atomic<bool>* cancel) {
-    const auto sequences = capture_sequences(ds, stations);
     std::vector<Vec3> xy;
     std::vector<double> xs, ys;
     for (const Station& station : stations) {
@@ -222,7 +288,8 @@ Heading loop_heading(const ParsedDataset& ds, const std::vector<Station>& statio
 }
 
 ScenePartition::Axes estimate_axes(const ParsedDataset& ds, const std::vector<Station>& stations,
-                                   PanoramaRoute route, const std::atomic<bool>* cancel) {
+                                   PanoramaRoute route, const CaptureSequences& sequences,
+                                   const std::atomic<bool>* cancel) {
     ScenePartition::Axes axes;
     std::vector<double> values(stations.size());
     for (int a = 0; a < 3; a++) {
@@ -246,7 +313,9 @@ ScenePartition::Axes estimate_axes(const ParsedDataset& ds, const std::vector<St
     if (route == PanoramaRoute::Loop) {
         constexpr double kMaxTransverseVarianceRatio = 0.01;
         constexpr double kRoadConfidence = (1 - kMaxTransverseVarianceRatio) / (1 + kMaxTransverseVarianceRatio);
-        axes.road_fallback = heading.confidence >= kRoadConfidence;
+        const Vec3 road = u * std::cos(heading.angle) + v * std::sin(heading.angle);
+        axes.road_fallback = heading.confidence >= kRoadConfidence &&
+                             !has_fold(sequences, stations, road, up.cross(road), cancel);
         if (!axes.road_fallback && !ds.gauge_oriented) {
             const Vec3 normal = loop_normal(stations, axes.origin, up);
             if (normal.norm() > 0) {
@@ -255,7 +324,7 @@ ScenePartition::Axes estimate_axes(const ParsedDataset& ds, const std::vector<St
                 std::tie(u, v) = horizontal_basis(up);
             }
         }
-        if (!axes.road_fallback) heading = loop_heading(ds, stations, axes.origin, u, v, cancel);
+        if (!axes.road_fallback) heading = loop_heading(sequences, stations, axes.origin, u, v, cancel);
     }
     axes.confidence = heading.confidence;
     axes.heading_fallback = axes.confidence < 0.25;
@@ -265,25 +334,67 @@ ScenePartition::Axes estimate_axes(const ParsedDataset& ds, const std::vector<St
     return axes;
 }
 
-std::vector<int> loop_successors(const std::vector<std::array<double, 2>>& xy) {
-    std::array<double, 2> center{};
-    for (int a = 0; a < 2; a++) {
-        const auto bounds = std::minmax_element(xy.begin(), xy.end(),
-            [a](const auto& x, const auto& y) { return x[a] < y[a]; });
-        center[a] = (*bounds.first)[a] + ((*bounds.second)[a] - (*bounds.first)[a]) / 2;
-    }
-    std::vector<std::pair<double, int>> order;
-    for (size_t i = 0; i < xy.size(); i++)
-        order.emplace_back(std::atan2(xy[i][1] - center[1], xy[i][0] - center[0]), (int)i);
-    std::sort(order.begin(), order.end());
-    std::vector<int> next(xy.size());
-    for (size_t i = 0; i < order.size(); i++) next[(size_t)order[i].second] = order[(i + 1) % order.size()].second;
-    return next;
-}
+struct CaptureRoute {
+    std::vector<std::vector<std::pair<size_t, double>>> links;
+    std::vector<std::vector<std::pair<size_t, size_t>>> short_runs;
+};
 
-Vec source_point(const ParsedDataset& ds, size_t i) {
-    return {ds.points.xyz[i * 3] + ds.center[0], ds.points.xyz[i * 3 + 1] + ds.center[1],
-            ds.points.xyz[i * 3 + 2] + ds.center[2]};
+CaptureRoute capture_route(const CaptureSequences& sequences, const std::vector<std::array<double, 2>>& xy,
+                           const Covisibility& cov, const std::atomic<bool>* cancel) {
+    std::map<std::pair<size_t, size_t>, double> links;
+    std::set<std::array<size_t, 3>> short_runs;
+    auto add = [&](size_t a, size_t b, double weight) {
+        auto& stored = links[std::minmax(a, b)];
+        stored = std::max(stored, weight);
+    };
+    auto displacement = [&](size_t a, size_t b) {
+        return Vec3{xy[b][0] - xy[a][0], xy[b][1] - xy[a][1], 0};
+    };
+    for (const auto& sequence : sequences) {
+        stop_if(cancel);
+        auto path = capture_path(sequence, displacement);
+        const double spacing = path.spacing;
+        if (spacing <= 0) continue;
+        const double max_step = 4 * spacing;
+        const size_t first = sequence.front(), last = sequence.back();
+        const Vec3 seam = displacement(last, first);
+        const Vec3 departure = path.chord(0, 1, false);
+        const Vec3 arrival = path.chord((int)path.steps.size() - 1, -1, false);
+        bool closed = false;
+        if (cov.has_tracks() && sequence.size() >= 4 && seam.norm() <= 2 * spacing &&
+            seam.dot(departure) >= 0 && seam.dot(arrival) >= 0 &&
+            std::none_of(path.steps.begin(), path.steps.end(), [=](Vec3 step) { return step.norm() > max_step; })) {
+            for (uint32_t e = cov.cameras.offs[first]; e < cov.cameras.offs[first + 1]; e++)
+                closed |= cov.cameras.adj[e] == last;
+            if (closed) path.steps.push_back(seam);
+        }
+        for (int i = 0; i < (int)path.steps.size(); i++) {
+            if (i % 1024 == 0) stop_if(cancel);
+            if (path.steps[i].norm() > max_step) continue;
+            const Vec3 before = path.chord(i - 1, -1, closed), after = path.chord(i + 1, 1, closed);
+            const double lengths = before.norm() * after.norm();
+            const double turn = lengths > 0 ? 1 - std::clamp(before.dot(after) / lengths, 0.0, 1.0) : 0;
+            add(sequence[i], sequence[(i + 1) % sequence.size()], 0.25 + 0.75 * turn);
+        }
+        const int n = (int)sequence.size();
+        for (int i = 0; i < n; i++) {
+            for (int radius : {1, 2, 3, 4}) {
+                if (2 * radius >= n || (!closed && (i < radius || i + radius >= n))) continue;
+                bool contiguous = true;
+                for (int j = i - radius; j < i + radius; j++)
+                    contiguous &= path.steps[(j + n) % n].norm() <= max_step;
+                if (!contiguous) continue;
+                const size_t a = sequence[(i - radius + n) % n], b = sequence[(i + radius) % n];
+                short_runs.insert({sequence[i], std::min(a, b), std::max(a, b)});
+            }
+        }
+    }
+    CaptureRoute out;
+    out.links.resize(xy.size());
+    out.short_runs.resize(xy.size());
+    for (const auto& entry : links) out.links[entry.first.first].emplace_back(entry.first.second, entry.second);
+    for (const auto& run : short_runs) out.short_runs[run[0]].emplace_back(run[1], run[2]);
+    return out;
 }
 
 struct Sample {
@@ -294,29 +405,58 @@ struct Sample {
 struct Candidate {
     double score, cut;
     int axis, left_parts;
+    int tier = 0;
+    bool fragments = false;
+    bool creates_short_run = false;
 };
 
 class SpatialCut {
 public:
     SpatialCut(const Covisibility& cov, const std::vector<double>& cost, const std::vector<int32_t>& initial,
                const std::vector<std::array<double, 2>>& xy, const std::vector<Sample>& samples,
-               const std::vector<int>& next, int budget, const std::atomic<bool>* cancel,
+               const CaptureRoute& route, bool two_axes, int budget, const std::atomic<bool>* cancel,
                ScenePartition::Axes& axes)
-        : cov(cov), cost(cost), initial(initial), xy(xy), samples(samples), next(next),
-          budget(budget), cancel(cancel), axes(axes) {}
+        : cov(cov), cost(cost), initial(initial), xy(xy), samples(samples), route(route),
+          two_axes(two_axes), budget(budget), cancel(cancel), axes(axes) {
+        if (!two_axes) return;
+        for (int a = 0; a < 2; a++) {
+            const auto [lo, hi] = std::minmax_element(xy.begin(), xy.end(), [a](const auto& x, const auto& y) {
+                return x[a] < y[a];
+            });
+            minimum_gap = std::max(minimum_gap, (*hi)[a] - (*lo)[a]);
+        }
+        minimum_gap *= 8 * std::numeric_limits<float>::epsilon();
+        core.resize(xy.size());
+        group.resize((size_t)*std::max_element(initial.begin(), initial.end()) + 1);
+        for (size_t s = 0; s < xy.size(); s++) {
+            if (s % 1024 == 0) stop_if(cancel);
+            const int label = initial[s];
+            double inside = 0, outside = 0;
+            for (uint32_t e = cov.cameras.offs[s]; e < cov.cameras.offs[s + 1]; e++)
+                (initial[cov.cameras.adj[e]] == label ? inside : outside) += cov.cameras.w[e];
+            if (inside > outside) core[s] = cost[s] * (inside - outside) / (inside + outside);
+            group[label].images += cost[s];
+            group[label].core += core[s];
+        }
+    }
 
     bool run(int count) {
         std::vector<int> stations(xy.size()), points(samples.size());
         std::iota(stations.begin(), stations.end(), 0);
         std::iota(points.begin(), points.end(), 0);
-        axes.splits.clear();
-        parts = 0;
-        attempts = 0;
-        int root = 0;
-        return split(stations, points, count, root);
+        const int max_tier = two_axes ? 2 : 0;
+        for (tier_limit = 0; tier_limit <= max_tier; tier_limit++) {
+            axes.splits.clear();
+            parts = 0;
+            attempts = 0;
+            int root = 0;
+            if (split(stations, points, count, root)) return true;
+        }
+        return false;
     }
 
     int parts = 0;
+    int relaxation() const { return tier_limit; }
 
 private:
     const Covisibility& cov;
@@ -324,11 +464,29 @@ private:
     const std::vector<int32_t>& initial;
     const std::vector<std::array<double, 2>>& xy;
     const std::vector<Sample>& samples;
-    const std::vector<int>& next;
+    const CaptureRoute& route;
+    bool two_axes;
     int budget;
     const std::atomic<bool>* cancel;
     ScenePartition::Axes& axes;
     int attempts = 0;
+    int tier_limit = 0;
+    double minimum_gap = 0;
+
+    struct Mass {
+        double images = 0, core = 0;
+    };
+    std::vector<Mass> group;
+    std::vector<double> core;
+
+    double core_loss(const Mass& left, const Mass& right, int label) const {
+        const double original = group[label].core;
+        const double available = left.core + right.core;
+        if (available <= original * 0.5) return 0;
+        // The threshold is relative to the original group, across all levels of the tree.
+        const double target = std::min(available, 0.75 * original);
+        return std::max(0.0, target - std::max(left.core, right.core)) / original;
+    }
 
     void coverage(const std::vector<double>& cuts, const std::vector<int>& points, const std::vector<int>& rank,
                   int axis, std::vector<double>& penalty) const {
@@ -363,12 +521,26 @@ private:
     void candidates(const std::vector<int>& stations, const std::vector<int>& points, int count,
                     int axis, std::vector<Candidate>& out) const {
         std::vector<int> sorted = stations;
-        std::sort(sorted.begin(), sorted.end(), [&](int a, int b) { return xy[a][axis] < xy[b][axis]; });
+        std::sort(sorted.begin(), sorted.end(), [&](int a, int b) {
+            return std::tie(xy[a][axis], xy[a][1 - axis], a) < std::tie(xy[b][axis], xy[b][1 - axis], b);
+        });
         const int n = (int)sorted.size();
+        auto new_position = [&](int i) {
+            if (i == 0) return true;
+            const auto& a = xy[sorted[i - 1]];
+            const auto& b = xy[sorted[i]];
+            return two_axes ? a != b : a[axis] != b[axis];
+        };
+        int distinct = 0;
+        if (count > 0) {
+            for (int i = 0; i < n; i++) distinct += new_position(i);
+            if (distinct < count) return;
+        }
         std::vector<int> rank(xy.size(), -1);
         for (int i = 0; i < n; i++) rank[sorted[i]] = i;
         std::vector<double> crossing((size_t)n + 1);
-        std::vector<int> cycle_low((size_t)n + 1), cycle_high(cycle_low);
+        std::vector<double> route_crossing((size_t)n + 1);
+        std::vector<int> short_crossing((size_t)n + 1);
         double total = 0;
         for (int i = 0; i < n; i++) {
             const int s = sorted[i];
@@ -380,49 +552,108 @@ private:
                 crossing[j + 1] -= w;
                 total += w;
             }
-            if (!next.empty() && rank[next[s]] >= 0) {
-                const int j = rank[next[s]];
-                cycle_low[std::max(i, j) + 1]++;
-                cycle_high[0]++;
-                cycle_high[std::min(i, j) + 1]--;
+            if (two_axes) {
+                for (const auto& [other, weight] : route.links[s]) {
+                    const int j = rank[other];
+                    if (j < 0) continue;
+                    route_crossing[std::min(i, j) + 1] += weight;
+                    route_crossing[std::max(i, j) + 1] -= weight;
+                }
+                for (const auto& [first, last] : route.short_runs[s]) {
+                    const auto [lo, hi] = std::minmax(rank[first], rank[last]);
+                    if (hi < 0 || (lo >= 0 && i >= lo && i <= hi)) continue;
+                    // An endpoint outside this node already has a different owner.
+                    const int endpoint = i < lo ? lo : hi;
+                    short_crossing[std::min(i, endpoint) + 1]++;
+                    short_crossing[std::max(i, endpoint) + 1]--;
+                }
             }
         }
-        std::vector<double> cuts;
-        for (int i = 1; i < n; i++) {
-            const double a = xy[sorted[i - 1]][axis], b = xy[sorted[i]][axis];
-            if (a < b) {
-                const double mid = a + (b - a) / 2;
-                cuts.push_back(mid > a ? mid : b);
-            }
+        const size_t first_option = out.size();
+        std::vector<Mass> left(xy.size()), right(xy.size());
+        double load = 0, total_load = 0, cut_weight = 0, route_weight = 0;
+        double broken = 0, group_loss = 0, core_damage = 0;
+        int groups = 0, distinct_left = 0, short_runs = 0;
+        for (int s : sorted) {
+            Mass& mass = right[initial[s]];
+            groups += mass.images == 0;
+            mass.images += two_axes ? cost[s] : 1;
+            if (two_axes) mass.core += core[s];
+            total_load += cost[s];
         }
-        std::vector<double> penalty(cuts.size());
-        if (!points.empty()) coverage(cuts, points, rank, axis, penalty);
-        std::vector<int> left(xy.size()), right(xy.size());
-        double load = 0, total_load = 0, cut_weight = 0;
-        int broken = 0, low_edges = 0, high_edges = cycle_high[0], k = 0;
-        for (int s : sorted) { right[initial[s]]++; total_load += cost[s]; }
+        const double small_load = 0.5 * std::min((double)budget, total_load / 2);
         for (int i = 1; i < n; i++) {
+            if (count > 0) distinct_left += new_position(i - 1);
             const int s = sorted[i - 1], label = initial[s];
-            broken -= std::min(left[label], right[label]);
-            ++left[label]; --right[label];
-            broken += std::min(left[label], right[label]);
-            load += cost[s]; cut_weight += crossing[i];
-            low_edges += cycle_low[i]; high_edges += cycle_high[i];
-            if (xy[s][axis] == xy[sorted[i]][axis]) continue;
-            const double cut = cuts[k];
-            const double missing = penalty[k++];
-            const double route_penalty = next.empty() ? 0 :
-                (std::max(0, i - low_edges - 1) + std::max(0, n - i - high_edges - 1));
-            const double base = (total > 0 ? cut_weight / total : 0) + 0.5 * broken / n +
-                                missing + route_penalty;
-            if (count > 0) {
-                const int min_left = std::max(1, count - (n - i));
-                const int max_left = std::min(count - 1, i);
-                for (int leaves = min_left; leaves <= max_left; leaves++)
-                    out.push_back({base + 0.5 * std::abs(load / total_load - (double)leaves / count), cut, axis, leaves});
-            } else {
-                out.push_back({base + 0.5 * std::abs(2 * load / total_load - 1), cut, axis, 0});
+            Mass& lo = left[label];
+            Mass& hi = right[label];
+            const double old_minority = std::min(lo.images, hi.images);
+            const double old_damage = two_axes ? core_loss(lo, hi, label) : 0;
+            const double images = two_axes ? cost[s] : 1;
+            lo.images += images;
+            hi.images -= images;
+            const double change = std::min(lo.images, hi.images) - old_minority;
+            broken += change;
+            if (two_axes) {
+                lo.core += core[s];
+                hi.core -= core[s];
+                group_loss += change / group[label].images;
+                core_damage += core_loss(lo, hi, label) - old_damage;
             }
+            load += cost[s]; cut_weight += crossing[i];
+            route_weight += route_crossing[i];
+            short_runs += short_crossing[i];
+            const double a = xy[s][axis], b = xy[sorted[i]][axis];
+            if (a == b) continue;
+            const bool narrow_gap = b - a <= minimum_gap;
+            const double mid = a + (b - a) / 2;
+            const double cut = mid > a ? mid : b;
+            const double route_penalty = std::max(0.0, route_weight);
+            double drift = 0.5 * broken / n;
+            if (two_axes) drift = broken / total_load + group_loss / groups + std::max(0.0, core_damage);
+            const double base = (total > 0 ? cut_weight / total : 0) + drift +
+                                0.05 * route_penalty / (1 + route_penalty) + 0.1 * short_runs / (1 + short_runs);
+            const int tier = core_damage > 1e-9 ? 1 : 0;
+            auto intact = [&](int label, const std::vector<Mass>& side, double side_load) {
+                return group[label].core > 0 && group[label].images == side_load && side[label].images == side_load;
+            };
+            const double high_load = total_load - load;
+            const bool intact_low = two_axes && intact(label, left, load);
+            const bool intact_high = two_axes && intact(initial[sorted[i]], right, high_load);
+            const bool fragments = two_axes && broken > 0;
+            const bool creates_short_run = short_runs > 0;
+            if (count > 0) {
+                const int min_left = std::max(1, count - (distinct - distinct_left));
+                const int max_left = std::min(count - 1, distinct_left);
+                for (int leaves = min_left; leaves <= max_left; leaves++) {
+                    const double target = (double)leaves / count;
+                    const bool thin = two_axes &&
+                        ((load < 0.75 * target * total_load && !(leaves == 1 && intact_low)) ||
+                         (high_load < 0.75 * (1 - target) * total_load && !(count - leaves == 1 && intact_high)));
+                    const int order = thin || narrow_gap ? 2 : tier;
+                    if (order <= tier_limit)
+                        out.push_back({base + 0.5 * std::abs(load / total_load - target),
+                                       cut, axis, leaves, order, fragments, creates_short_run});
+                }
+            } else {
+                const bool thin = two_axes && ((load < small_load && !intact_low) ||
+                                               (high_load < small_load && !intact_high));
+                const int order = thin || narrow_gap ? 2 : tier;
+                if (order <= tier_limit)
+                    out.push_back({base + 0.5 * std::abs(2 * load / total_load - 1),
+                                   cut, axis, 0, order, fragments, creates_short_run});
+            }
+        }
+        if (points.empty() || out.size() == first_option) return;
+        std::vector<double> cuts;
+        for (size_t i = first_option; i < out.size(); i++)
+            if (cuts.empty() || cuts.back() != out[i].cut) cuts.push_back(out[i].cut);
+        std::vector<double> penalty(cuts.size());
+        coverage(cuts, points, rank, axis, penalty);
+        size_t k = 0;
+        for (size_t i = first_option; i < out.size(); i++) {
+            if (out[i].cut != cuts[k]) k++;
+            out[i].score += penalty[k];
         }
     }
 
@@ -435,9 +666,10 @@ private:
         if (stations.size() < 2) return false;
         std::vector<Candidate> options;
         candidates(stations, points, count, 0, options);
-        if (!next.empty()) candidates(stations, points, count, 1, options);
+        if (two_axes) candidates(stations, points, count, 1, options);
         std::sort(options.begin(), options.end(), [](const Candidate& a, const Candidate& b) {
-            return std::tie(a.score, a.axis, a.cut, a.left_parts) < std::tie(b.score, b.axis, b.cut, b.left_parts);
+            return std::tie(a.tier, a.fragments, a.creates_short_run, a.score, a.axis, a.cut, a.left_parts) <
+                   std::tie(b.tier, b.fragments, b.creates_short_run, b.score, b.axis, b.cut, b.left_parts);
         });
         const int saved_parts = parts;
         node = (int)axes.splits.size();
@@ -473,25 +705,29 @@ int ScenePartition::Axes::owner(const double p[3]) const {
 }
 
 std::shared_ptr<const Region> ScenePartition::Axes::region(int part) const {
-    auto r = std::make_shared<CsgRegion>();
-    r->op = CsgOp::Intersection;
+    if (part < 0) return nullptr;
     if (splits.empty()) {
+        if (part != 0) return nullptr;
         auto all = std::make_shared<HalfSpaceRegion>();
         std::fill_n(all->normal, 3, 0.0);
         all->offset = 1;
         return all;
     }
+    auto cells = std::make_shared<CsgRegion>();
+    cells->op = CsgOp::Union;
     using Bounds = std::array<double, 2>;
     const double inf = std::numeric_limits<double>::infinity();
-    auto find = [&](auto&& self, int i, Bounds lo, Bounds hi) -> bool {
+    auto collect = [&](auto&& self, int i, Bounds lo, Bounds hi) -> void {
         if (i < 0) {
-            if (~i != part) return false;
+            if (~i != part) return;
+            auto cell = std::make_shared<CsgRegion>();
+            cell->op = CsgOp::Intersection;
             for (int a = 0; a < 2; a++) {
                 if (std::isfinite(lo[a])) {
                     auto plane = std::make_shared<HalfSpaceRegion>();
                     std::copy(basis[a].begin(), basis[a].end(), plane->normal);
                     plane->offset = -lo[a];
-                    r->children.push_back(plane);
+                    cell->children.push_back(plane);
                 }
                 if (std::isfinite(hi[a])) {
                     auto plane = std::make_shared<HalfSpaceRegion>();
@@ -500,18 +736,23 @@ std::shared_ptr<const Region> ScenePartition::Axes::region(int part) const {
                     auto complement = std::make_shared<CsgRegion>();
                     complement->op = CsgOp::Complement;
                     complement->children.push_back(plane);
-                    r->children.push_back(complement);
+                    cell->children.push_back(complement);
                 }
             }
-            return true;
+            cells->children.push_back(cell);
+            return;
         }
         const AxisSplit& s = splits[(size_t)i];
         Bounds left = hi, right = lo;
         left[s.axis] = std::min(left[s.axis], s.cut);
         right[s.axis] = std::max(right[s.axis], s.cut);
-        return self(self, s.low, lo, left) || self(self, s.high, right, hi);
+        self(self, s.low, lo, left);
+        self(self, s.high, right, hi);
     };
-    return find(find, 0, {-inf, -inf}, {inf, inf}) ? r : nullptr;
+    collect(collect, 0, {-inf, -inf}, {inf, inf});
+    if (cells->children.empty()) return nullptr;
+    if (cells->children.size() == 1) return cells->children.front();
+    return cells;
 }
 
 void panorama_proximity(const ParsedDataset& ds, Covisibility& cov, int neighbours,
@@ -756,16 +997,21 @@ void partition_panorama(const ParsedDataset& ds, const Covisibility& cov, SceneP
     if (cov.cameras.n() != stations.size() || (cov.has_tracks() && cov.num_points() != ds.points.num()))
         throw std::runtime_error("axis-aligned partition: invalid station graph");
     for (size_t f = 0; f < p.frame_centers.size(); f++) p.frame_centers[f] += (float)ds.center[f % 3];
-    const auto axis_frame = estimate_axes(ds, stations, opt.panorama_route, cancel);
+    const auto sequences = opt.panorama_route == PanoramaRoute::Loop ? capture_sequences(ds, stations, cancel)
+                                                                    : CaptureSequences{};
+    const auto axis_frame = estimate_axes(ds, stations, opt.panorama_route, sequences, cancel);
     const auto route = axis_frame.road_fallback ? PanoramaRoute::Road : opt.panorama_route;
+    const bool two_axes = route != PanoramaRoute::Road;
     if (log && axis_frame.road_fallback) log("panorama loop: straight trajectory detected; cutting across the road");
     std::vector<double> cost(stations.size());
+    std::vector<Vec> coordinates(stations.size());
     std::vector<std::array<double, 2>> xy(stations.size());
     for (size_t i = 0; i < stations.size(); i++) {
         cost[i] = (double)stations[i].frames.size();
+        coordinates[i] = stations[i].center;
         for (int a = 0; a < 2; a++) xy[i][a] = project(axis_frame.basis[a], stations[i].center.data());
     }
-    const auto next = route == PanoramaRoute::Loop ? loop_successors(xy) : std::vector<int>{};
+    const auto capture = two_axes ? capture_route(sequences, xy, cov, cancel) : CaptureRoute{};
     const size_t n_points = (size_t)ds.points.num();
     std::vector<Sample> sample;
     if (cov.has_tracks()) {
@@ -784,6 +1030,7 @@ void partition_panorama(const ParsedDataset& ds, const Covisibility& cov, SceneP
     std::vector<BorrowCandidates> candidates;
     std::vector<int> owners(stations.size());
     std::vector<int32_t> initial;
+    int relaxation = 0;
     p.point_label.resize(n_points);
     for (int attempt = 0; attempt < 6; attempt++) {
         graph::LabelCutOptions options;
@@ -796,15 +1043,17 @@ void partition_panorama(const ParsedDataset& ds, const Covisibility& cov, SceneP
         stop_if(cancel);
 
         auto axes = std::make_shared<ScenePartition::Axes>(axis_frame);
-        SpatialCut cut(cov, cost, labels, xy, sample, next, budget, cancel, *axes);
+        SpatialCut cut(cov, cost, labels, xy, sample, capture, two_axes, budget, cancel, *axes);
         if (!cut.run(std::max(0, opt.parts))) {
             if (p.axes) break;
             throw std::runtime_error("axis-aligned partition: no spatial cut satisfies the image or part limit");
         }
         p.axes = std::move(axes);
         p.num_parts = cut.parts;
+        relaxation = cut.relaxation();
         initial = std::move(labels);
         for (size_t s = 0; s < stations.size(); s++) owners[s] = p.axes->owner(stations[s].center.data());
+        if (two_axes) refine_panorama_ownership(ds, cov, coordinates, xy, owners, p.num_parts, cancel, *p.axes);
         for (size_t i = 0; i < n_points; i++) {
             if (i % 65536 == 0) stop_if(cancel);
             p.point_label[i] = p.axes->owner(source_point(ds, i).data());
@@ -831,19 +1080,23 @@ void partition_panorama(const ParsedDataset& ds, const Covisibility& cov, SceneP
         }
     p.cut_fraction = total > 0 ? crossing / total : 0;
     if (log) {
-        std::vector<int> initial_owner(stations.size(), -1);
-        std::vector<bool> fragmented(stations.size());
-        for (size_t s = 0; s < stations.size(); s++) {
-            const int g = initial[s];
-            if (initial_owner[g] < 0) initial_owner[g] = owners[s];
-            else if (initial_owner[g] != owners[s]) fragmented[g] = true;
+        std::vector<std::map<int, int64_t>> final_loads((size_t)*std::max_element(initial.begin(), initial.end()) + 1);
+        for (size_t s = 0; s < stations.size(); s++) final_loads[initial[s]][owners[s]] += (int64_t)cost[s];
+        int64_t retained = 0;
+        int fragmented = 0;
+        for (const auto& loads : final_loads) {
+            int64_t main_leaf = 0;
+            for (const auto& load : loads) main_leaf = std::max(main_leaf, load.second);
+            retained += main_leaf;
+            fragmented += loads.size() > 1;
         }
-        char buf[256];
+        char buf[320];
         std::snprintf(buf, sizeof buf,
-            "panorama %s: parts %d, stations %zu, up %s, heading confidence %.2f%s, cut %.1f%%, split initial groups %zu",
+            "panorama %s: parts %d, stations %zu, up %s, heading confidence %.2f%s, cut %.1f%%, split initial groups %d, "
+            "initial group images retained %lld/%lld (%.1f%%), fit relaxation %d",
             panorama_route_name(route), p.num_parts, stations.size(), p.axes->up_source.c_str(),
-            p.axes->confidence, p.axes->heading_fallback ? " (fallback)" : "", p.cut_fraction * 100,
-            (size_t)std::count(fragmented.begin(), fragmented.end(), true));
+            p.axes->confidence, p.axes->heading_fallback ? " (fallback)" : "", p.cut_fraction * 100, fragmented,
+            (long long)retained, (long long)ds.num_cameras, 100.0 * retained / ds.num_cameras, relaxation);
         log(buf);
     }
     collect_parts(cov, stations, observed, owners, cost, candidates, p, log, cancel);

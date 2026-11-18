@@ -121,6 +121,8 @@ struct ScenePartition {
         int low, high;  // Node index or bitwise complement of the leaf label.
     };
     struct Axes {
+        static constexpr int kMaxCellsPerPart = 5;
+
         std::array<double, 3> origin{};
         std::array<std::array<double, 3>, 3> basis{};
         double confidence = 0;

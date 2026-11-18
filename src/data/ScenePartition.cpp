@@ -1692,7 +1692,9 @@ std::shared_ptr<ScenePartition::Axes> read_axes(const JsonValue* value, int part
     const auto* basis = value->find("basis");
     const auto* splits = value->find("splits");
     if (!origin || !basis || !splits || !basis->is_array() || basis->arr.size() != 3 ||
-        !splits->is_array() || splits->arr.size() != (size_t)(parts - 1)) throw bad();
+        !splits->is_array() || splits->arr.size() < (size_t)(parts - 1) ||
+        splits->arr.size() >= (size_t)parts * ScenePartition::Axes::kMaxCellsPerPart ||
+        (parts == 1 && !splits->arr.empty())) throw bad();
     const auto read_vector = [&](const JsonValue& v) {
         std::array<double, 3> result{};
         if (!v.is_array() || v.arr.size() != 3) throw bad();
@@ -1715,19 +1717,19 @@ std::shared_ptr<ScenePartition::Axes> read_axes(const JsonValue* value, int part
     if (const auto* source = value->find("up_source")) axes->up_source = source->as_string();
     if (const auto* fallback = value->find("heading_fallback")) axes->heading_fallback = fallback->as_bool();
     if (const auto* fallback = value->find("road_fallback")) axes->road_fallback = fallback->as_bool();
-    std::vector<bool> visited_nodes(splits->arr.size()), visited_parts((size_t)parts);
+    std::vector<bool> visited_nodes(splits->arr.size());
+    std::vector<int> cells((size_t)parts);
     for (size_t i = 0; i < splits->arr.size(); i++) {
         const auto& s = splits->arr[i];
         if (!s.is_array() || s.arr.size() != 4) throw bad();
         const double axis = s.arr[0].as_double(-1), cut = s.arr[1].as_double(std::numeric_limits<double>::quiet_NaN());
         if ((axis != 0 && axis != 1) || !std::isfinite(cut)) throw bad();
         auto child = [&](int slot) {
-            const double d = s.arr[slot].as_double(0);
+            const double d = s.arr[slot].as_double(std::numeric_limits<double>::quiet_NaN());
             if (!(d >= -parts && d < (double)splits->arr.size()) || std::trunc(d) != d) throw bad();
             const int j = (int)d;
             if (j < 0) {
-                if (visited_parts[~j]) throw bad();
-                visited_parts[~j] = true;
+                if (++cells[~j] > ScenePartition::Axes::kMaxCellsPerPart) throw bad();
             } else {
                 if (j <= (int)i || visited_nodes[j]) throw bad();
                 visited_nodes[j] = true;
@@ -1736,6 +1738,22 @@ std::shared_ptr<ScenePartition::Axes> read_axes(const JsonValue* value, int part
         };
         const int low = child(2), high = child(3);
         axes->splits.push_back({(int)axis, cut, low, high});
+    }
+    if (!axes->splits.empty()) {
+        if (std::find(visited_nodes.begin() + 1, visited_nodes.end(), false) != visited_nodes.end() ||
+            std::find(cells.begin(), cells.end(), 0) != cells.end()) throw bad();
+        using Bounds = std::array<double, 2>;
+        const double inf = std::numeric_limits<double>::infinity();
+        auto check_bounds = [&](auto&& self, int i, Bounds lo, Bounds hi) -> void {
+            if (i < 0) return;
+            const auto& s = axes->splits[(size_t)i];
+            if (!(lo[s.axis] < s.cut && s.cut < hi[s.axis])) throw bad();
+            Bounds low_hi = hi, high_lo = lo;
+            low_hi[s.axis] = high_lo[s.axis] = s.cut;
+            self(self, s.low, lo, low_hi);
+            self(self, s.high, high_lo, hi);
+        };
+        check_bounds(check_bounds, 0, {-inf, -inf}, {inf, inf});
     }
     return axes;
 }
