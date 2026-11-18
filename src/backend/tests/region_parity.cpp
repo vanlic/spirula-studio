@@ -10,6 +10,7 @@
 #include "data/LabelField.h"
 #include "data/Region.h"
 #include "data/RegionProgram.h"
+#include "data/ScenePartition.h"
 
 #include <cmath>
 #include <cstdio>
@@ -305,6 +306,48 @@ int main() {
         backend::device_free(d_hq);
         backend::device_free(d_hs);
         backend::device_free(k_half);
+    }
+
+    {
+        ScenePartition::Axes axes;
+        axes.basis = {{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}};
+        constexpr int cells = ScenePartition::Axes::kMaxCellsPerPart;
+        for (int i = 0; i < cells - 1; i++) {
+            axes.splits.push_back({1, 200.0 + i, 2 * i + 1, 2 * i + 2});
+            axes.splits.push_back({0, 100.0 + i % 2, ~0, ~1});
+        }
+        axes.splits.push_back({0, 100.0 + (cells - 1) % 2, ~0, ~1});
+
+        const double shift[] = {-200, -400, 0};
+        std::vector<float> train;
+        std::vector<int> owners;
+        for (int yi = -2; yi <= 2 * cells; yi++)
+            for (int xi = -2; xi <= 4; xi++) {
+                const double p[] = {100.0 + xi * 0.5, 200.0 + yi * 0.5, 0};
+                owners.push_back(axes.owner(p));
+                train.insert(train.end(), {(float)xi, (float)yi, 0});
+            }
+        const int64_t count = (int64_t)owners.size();
+        auto* d_train = upload(train);
+        for (int part = 0; part < 2; part++) {
+            RegionProgram hp;
+            check(compile_region(*axes.region(part), hp, err, 2.0, shift), "axis cells compile");
+            void* k_cells;
+            const auto d_cells = dv4(hp.nodes, k_cells);
+            region_weight_tensor(count, dv<float3>(d_train, count), DeviceVector<float4>(),
+                                 dv<float3>(d_scales, count), DeviceVector<float4>(), DeviceVector<float4>(),
+                                 DeviceVector<float4>(), seed, d_cells, DeviceVector<float4>(),
+                                 DeviceVector<float4>(), 1.0f, 1e-4f, dv<float>(d_w, count));
+            backend::device_synchronize();
+            std::vector<float> w((size_t)count);
+            backend::memcpy_sync(w.data(), d_w, w.size() * sizeof(float), MemcpyKind::DeviceToHost);
+            bool same = true;
+            for (size_t i = 0; i < w.size(); i++)
+                same &= (w[i] > 0.5f) == (owners[i] == part);
+            check(same, "device ownership agrees across all axis cells and their exact cut planes");
+            backend::device_free(k_cells);
+        }
+        backend::device_free(d_train);
     }
 
     // The wall itself: a thin splat on the wall facing room B belongs to B

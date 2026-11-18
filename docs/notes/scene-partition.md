@@ -10,8 +10,8 @@ into one model. The code is portable host code in `data/ScenePartition.h`,
 hooks are `--partition` / `--partition-part` and `--roi-region`
 (`TrainerSession::apply_partition_config`, `setup_region`).
 
-The `axis-aligned` method splits 360° captures along a straight road or
-around one building. See [panorama partitioning](axis-aligned-scene-partition.md).
+The `axis-aligned` method fits vertical cuts to 360° captures along straight
+roads, open routes and closed loops. See [panorama partitioning](axis-aligned-scene-partition.md).
 
 ## Why not Voronoi over the cameras
 
@@ -237,8 +237,12 @@ matches the full model.
   nodes [m,8] as floats), the camera centres [N,3], then u8 owner per seed
   point in file order, then per part a u32 count and u32 point indices.
 
-The trainer needs the JSON's frame lists, the BIN's point tables and the
-field (its region of interest); the merge needs the field and the centres. A run's `config.json` carries `partition` and
+- Axis-aligned partitions store their axes and cut tree in JSON v2. Several
+  rectangular leaves can share a logical part label. BIN v3 stores the same
+  camera and point tables, with the cut tree supplying the ownership geometry.
+
+The trainer uses the frame lists, point tables and ownership region.
+A run's `config.json` carries `partition` and
 `partition_part`, which is how `find_partition_runs` pairs runs with parts
 without any naming convention.
 
