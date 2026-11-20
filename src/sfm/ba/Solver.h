@@ -100,6 +100,8 @@ public:
     }
 
     void init() {
+        if (!P_.point_planes.empty() && P_.point_planes.size() != 4 * size_t(P_.num_points))
+            throw std::runtime_error("BA point planes must have four coefficients per point");
         auto prof_t0 = std::chrono::steady_clock::now();
         auto prof_lap = [&prof_t0] {
             auto t1 = std::chrono::steady_clock::now();
@@ -206,7 +208,7 @@ public:
                     &bCamRanges_, &bCamObs_, &bCamChunks_, &bCgR_, &bCgZ_, &bCgP_, &bCgSp_,
                     &bCgV_, &bCgB_, &bCgM_, &bCgScal_, &bCgPart_, &bPrecBlocks_,
                     &bPriorRows_, &bPriorCols_, &bPriorErow_, &bPriorBlk_, &bPriorG_,
-                    &bGradCam_, &bGradPt_};
+                    &bGradCam_, &bGradPt_, &bPointPlanes_};
         for (uint32_t c = 0; c + 1 < kMaxJacChunks; c++) {
             ownBufs_.push_back(&bJcX_[c]);
             ownBufs_.push_back(&bJpX_[c]);
@@ -225,6 +227,7 @@ public:
         bExts_ = mkReal(P_.exts.size());
         bIntr_ = mkReal(P_.total_intr);
         bPoints_ = mkReal(3 * (uint64_t)P_.num_points);
+        bPointPlanes_ = mkReal(P_.point_planes.size());
         bObsRanges_ = mkUint(P_.num_points + 1);
         bModelObs_ = mkUint(obsIdentity_ ? 1 : P_.model_obs.size());
         bJcOff_ = mkUint(P_.num_obs);
@@ -318,6 +321,7 @@ public:
                     binds.push_back(rest[c].buf ? rest[c].buf : first->buf);
         binds.push_back(bObs_.buf);  // 69, 70: the fp32 views of obs and residual
         binds.push_back(bRes_.buf);
+        binds.push_back(bPointPlanes_.buf);
         double t_buf = prof_lap();
         ctx_.createDescriptors(binds);
         // Fresh-from-the-driver allocations happen to arrive zeroed; memory
@@ -342,6 +346,10 @@ public:
             std::string("dp_accum") + schurSuffix_,
         };
         if (!P_.members.empty()) entries.push_back("ext_update");
+        if (!P_.point_planes.empty()) {
+            entries.push_back("plane_cost");
+            entries.push_back("plane_linearize");
+        }
         if (gradOn_) {
             entries.push_back("grad_point_max");
             entries.push_back(std::string("grad_cam") + schurSuffix_);
@@ -450,6 +458,8 @@ public:
         std::vector<uint32_t> jc_off32;
         jc_off32.reserve(P_.jc_off.size());
         for (uint64_t off : P_.jc_off) jc_off32.push_back((uint32_t)off);
+        std::vector<uint8_t> pointPlanes;
+        packReals(pointPlanes, P_.point_planes.data(), P_.point_planes.size(), opt_.real);
         std::vector<VkContext::UploadItem> up = {
             {&bObs_, obs.data(), obs.size()},
             {&bObsImage_, P_.obs_image.data(), P_.obs_image.size() * 4},
@@ -462,6 +472,7 @@ public:
             {&bPoses_, poses.data(), poses.size()},
             {&bIntr_, intr.data(), intr.size()},
             {&bPoints_, points.data(), points.size()},
+            {&bPointPlanes_, pointPlanes.data(), pointPlanes.size()},
         };
         if (!P_.members.empty()) {
             up.push_back({&bMemberInfo_, mi.data(), mi.size() * 4});
@@ -1367,6 +1378,11 @@ private:
             p.f0 = opt_.loss_param;
             launch(costEntry(mr), mr.count, 256, kWCost, p, atModel(mr));
         }
+        if (!P_.point_planes.empty()) {
+            Push p;
+            p.u0 = P_.num_points;
+            launch("plane_cost", P_.num_points, 256, kWCost, p, atBase);
+        }
         ctx_.barrier(cb_);
     }
 
@@ -1407,6 +1423,12 @@ private:
             }
             ctx_.barrier(cb_);
 
+            if (!P_.point_planes.empty()) {
+                Push p;
+                p.u0 = P_.num_points;
+                launch("plane_linearize", P_.num_points, 256, kWPoint, p, atBase);
+                ctx_.barrier(cb_);
+            }
             ctx_.copy(cb_, bBp_, bBp0_, bBp_.size);
             ctx_.barrier(cb_);
             if (gradOn_) recordGradient();
@@ -1796,7 +1818,7 @@ private:
         return b;
     }
     GpuBuffer bObs_, bObsImage_, bObsPoint_, bImageInfo_, bGroupInfo_, bMemberInfo_;
-    GpuBuffer bPoses_, bExts_, bIntr_, bPoints_, bObsRanges_, bModelObs_, bJcOff_;
+    GpuBuffer bPoses_, bExts_, bIntr_, bPoints_, bObsRanges_, bModelObs_, bJcOff_, bPointPlanes_;
     GpuBuffer bJp_, bS_, bG_, bApp_, bBp_, bCost_;
     GpuBuffer bPosesBak_, bExtsBak_, bIntrBak_, bPointsBak_;
     bool restore_pending_ = false;  // a rejected step's parameters are still live

@@ -239,9 +239,17 @@ void resolveImageNames(std::vector<Reconstruction>& models, const std::string& i
 void recolorPoints(std::vector<Reconstruction>& models, const SfmConfig& cfg);
 void splitCamerasBySize(std::vector<Reconstruction>& models,
                         const std::vector<FeatureSet>& feats);
+struct ReprojectionStats {
+    size_t measured = 0, skipped = 0;
+    double mean = 0, max = 0, median = 0;
+};
 void writeModels(std::vector<Reconstruction>& models,
                  const std::filesystem::path& dir, bool verbose,
                  const std::vector<ModelGauge>& gauge = {}, const RigTable* rigs = nullptr);
+void writeModels(std::vector<Reconstruction>& models,
+                 const std::filesystem::path& dir, bool verbose,
+                 const std::vector<ModelGauge>& gauge, const RigTable* rigs,
+                 std::vector<ReprojectionStats>* reprojection);
 void writeRigs(const std::filesystem::path& dir, const Reconstruction& m, const RigTable* rigs);
 // The rigs.txt writeRigs left beside a model, as a table over its image names
 // with each member's calibration in `m.rigs`. Empty when there is no file.

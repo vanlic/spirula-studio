@@ -1,6 +1,7 @@
 // DatasetPrep.cpp -- see DatasetPrep.h.
 
 #include "data/ImageDiscovery.h"
+#include "data/LinkOrCopy.h"
 #include "app/gui/DatasetPrep.h"
 
 #include "app/CubeLut.h"
@@ -3393,11 +3394,9 @@ bool DatasetPrep::gather_photos(const PrepJob& job, const PrepInput& in,
                     return true;
                 }
             } else {
-                fs::create_hard_link(m.from, dst, op_ec);
-                if (!op_ec) { tally.linked++; return true; }
-                op_ec.clear();
-                fs::copy_file(m.from, dst, op_ec);
-                if (!op_ec) { tally.copied++; return true; }
+                const auto transfer = spirula::files::link_or_copy(m.from, dst, op_ec);
+                if (transfer == spirula::files::Transfer::Linked) { tally.linked++; return true; }
+                if (transfer == spirula::files::Transfer::Copied) { tally.copied++; return true; }
             }
             std::lock_guard<std::mutex> lk(notes_mu);
             if (failure.empty())

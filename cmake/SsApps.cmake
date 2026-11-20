@@ -145,6 +145,7 @@ if(SS_BUILD_SFM)
     # The SfM module carries its own Vulkan context and SPIR-V and shares
     # nothing with the training engine.
     list(APPEND SS_TOOL_SOURCES
+         ${SS_SRC}/app/PoseSurvey.cpp
          ${SS_SRC}/app/cli/sfm_main.cpp
          ${SS_SRC}/app/cli/sfm_ba.cpp)
     list(APPEND SS_TOOL_DEFS SS_TOOL_SFM=1)

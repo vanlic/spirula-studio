@@ -3,6 +3,7 @@
 #include "app/E57Dataset.h"
 #include "app/ScanDepth.h"
 #include "core/CameraModel.h"
+#include "data/PointCloudFile.h"
 
 #include <algorithm>
 #include <array>
@@ -169,6 +170,56 @@ AlignCloud make_align_cloud(std::vector<double>& xyz, std::vector<uint8_t>& rgb,
         for (int a = 0; a < 3; a++) c.normal[(size_t)i * 3 + a] = (float)nv[a];
     }
     return c;
+}
+
+AlignCloud load_scan_planes(const std::string& path) {
+    spirula::cloud::Reader reader(path);
+    const uint64_t stride = std::max<int64_t>(1, (reader.info().points + 1999999) / 2000000);
+    std::vector<double> xyz;
+    std::vector<uint8_t> rgb;
+    uint64_t index = 0;
+    reader.read([&](const spirula::e57::Point* batch, size_t count) {
+        for (size_t i = 0; i < count; ++i, ++index) {
+            if (index % stride) continue;
+            xyz.insert(xyz.end(), batch[i].xyz, batch[i].xyz + 3);
+            rgb.insert(rgb.end(), batch[i].rgb, batch[i].rgb + 3);
+        }
+    });
+    if (xyz.size() < 18) throw std::runtime_error("LiDAR scan has too few points to fit planes");
+    return make_align_cloud(xyz, rgb, 400000);
+}
+
+size_t attach_scan_planes(const AlignCloud& cloud, const std::vector<double>& points,
+                          double max_distance, double weight, std::vector<double>& planes) {
+    if (!std::isfinite(max_distance) || max_distance <= 0 ||
+        !std::isfinite(weight) || weight <= 0)
+        throw std::runtime_error("LiDAR bundle adjustment requires positive distance and weight");
+    planes.assign(4 * (points.size() / 3), 0.0);
+    size_t count = 0;
+    for (size_t i = 0; i < points.size() / 3; ++i) {
+        float query[3];
+        for (int axis = 0; axis < 3; ++axis)
+            query[axis] = float(points[3 * i + axis] - cloud.origin[axis]);
+        float d2[1];
+        int32_t nearest[1];
+        if (cloud.tree->query(query, -1, 1, d2, nearest) == 0 ||
+            d2[0] > max_distance * max_distance) continue;
+        const size_t base = 3 * size_t(nearest[0]);
+        const float* normal = cloud.normal.data() + base;
+        if (normal[0] == 0 && normal[1] == 0 && normal[2] == 0) continue;
+        double* plane = planes.data() + 4 * i;
+        for (int axis = 0; axis < 3; ++axis) {
+            plane[axis] = weight * normal[axis];
+            plane[3] -= plane[axis] * (cloud.origin[axis] + cloud.xyz[base + axis]);
+        }
+        ++count;
+    }
+    return count;
+}
+
+size_t attach_scan_planes(const std::string& path, const std::vector<double>& points,
+                          double max_distance, double weight, std::vector<double>& planes) {
+    return attach_scan_planes(load_scan_planes(path), points, max_distance, weight, planes);
 }
 
 int find_view(const ModelGeometry& m, const std::string& name) {

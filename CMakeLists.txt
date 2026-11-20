@@ -35,6 +35,7 @@ include(SsSources)
 # test binaries link a backend without the engine.
 include(SsI18n)
 include(SsLicense)
+include(SsLaszip)
 
 # The web viewer's browser client is compiled into the engine library
 # (app/webviewer/Viewer.cpp), so it must be embedded before either backend

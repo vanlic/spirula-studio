@@ -165,7 +165,7 @@ int spirula_lidar_main(int argc, char** argv) {
                 std::fprintf(stderr, "%s\n\n", format(L::err_unknown_option, {a}).c_str());
                 usage();
                 return 2;
-            } else if (spirula::cloud::is_cloud_path(a) || spirula::cloud::is_laz_path(a)) {
+            } else if (spirula::cloud::is_cloud_path(a)) {
                 opt.clouds.push_back(a);
             } else if (opt.dataset.empty()) {
                 opt.dataset = a;

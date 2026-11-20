@@ -123,12 +123,12 @@ struct Reconstruction {
         return id;
     }
 
-    void updatePointErrors();
+    void updatePointErrors(std::vector<double>* observation_errors = nullptr);
     void writeBinary(const std::string& dir) const;
     static Reconstruction readBinary(const std::string& dir);
 };
 
-inline void Reconstruction::updatePointErrors() {
+inline void Reconstruction::updatePointErrors(std::vector<double>* observation_errors) {
     using ImageCamera = std::pair<const Image*, const Camera*>;
     std::unordered_map<uint32_t, ImageCamera> image_cameras;
     image_cameras.reserve(images.size());
@@ -159,6 +159,7 @@ inline void Reconstruction::updatePointErrors() {
             Vec2 pixel = camera.project(p);
             double error = std::hypot(pixel.x - keypoint.x, pixel.y - keypoint.y);
             if (!std::isfinite(error)) continue;
+            if (observation_errors) observation_errors->push_back(error);
             sum += error;
             count++;
         }

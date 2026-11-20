@@ -1,12 +1,17 @@
 // `spirula-sfm ba` -- one global bundle adjustment of a sparse model, the one
 // the mapper runs, written back out; or the solver on a BAL problem (Bundle
 // Adjustment in the Large), for benchmarking. See src/sfm/ba/README.md.
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <random>
 
+#ifdef SS_TOOL_TRAIN
+#include "app/LidarAlign.h"
+#include "sfm/map/MetricGauge.h"
+#endif
 #include "sfm/Pipeline.h"
 #include "sfm/SfmConfig.h"
 #include "sfm/ba/Problem.h"
@@ -79,6 +84,12 @@ void printBaHelp(FILE* out) {
         {"--profile", "", &H::ba_opt_profile},
         {"--quiet", "", &H::ba_opt_quiet},
         {"--spv-path FILE", "", &H::ba_opt_spv_path},
+#ifdef SS_TOOL_TRAIN
+        {"--lidar-scan FILE", "", &H::ba_opt_lidar_scan},
+        {"--lidar-distance M", "0.25", &H::ba_opt_lidar_distance},
+        {"--lidar-weight X", "20", &H::ba_opt_lidar_weight},
+        {"--lidar-positions FILE", "", &H::ba_opt_lidar_positions},
+#endif
         {"-h, --help", "", &H::opt_help},
     };
     std::fprintf(out, "\n%s\n", H::label_options.get());
@@ -147,6 +158,10 @@ static size_t calibratedMembers(const sfm::Reconstruction& rec) {
 int cmdBa(int argc, char** argv) {
     std::vector<std::string> paths;
     std::string loss = "trivial", model = "snavely";
+#ifdef SS_TOOL_TRAIN
+    std::string lidar_scan, lidar_positions;
+    double lidar_distance = 0.25, lidar_weight = 20.0;
+#endif
     SolverOptions opt;
     bool shared_intr = false, loss_given = false;
     std::vector<sfm::RigDef> rig_defs;
@@ -162,6 +177,12 @@ int cmdBa(int argc, char** argv) {
             else if (a == "--real") opt.real = realCfgFromName(next());
             else if (a == "--loss") { loss = next(); loss_given = true; }
             else if (a == "--spv-path") opt.spv_path = next();
+#ifdef SS_TOOL_TRAIN
+            else if (a == "--lidar-scan") lidar_scan = next();
+            else if (a == "--lidar-distance") lidar_distance = std::stod(next());
+            else if (a == "--lidar-weight") lidar_weight = std::stod(next());
+            else if (a == "--lidar-positions") lidar_positions = next();
+#endif
             else if (a == "--loss-param") { opt.loss_param = std::stof(next()); loss_given = true; }
             else if (a == "--model") model = next();
             else if (a == "--shared-intrinsics") shared_intr = true;
@@ -266,6 +287,16 @@ int cmdBa(int argc, char** argv) {
     // global BA builds, with its loss defaults and the rigs its run wrote.
     std::error_code dir_ec;
     const bool is_model = std::filesystem::is_directory(file, dir_ec);
+#ifdef SS_TOOL_TRAIN
+    if (!lidar_positions.empty() && lidar_scan.empty()) {
+        std::fprintf(stderr, "--lidar-positions requires --lidar-scan.\n");
+        return 1;
+    }
+    if (!is_model && !lidar_scan.empty()) {
+        std::fprintf(stderr, "LiDAR bundle adjustment requires a sparse COLMAP model in the scan frame.\n");
+        return 1;
+    }
+#endif
 
     auto t0 = std::chrono::high_resolution_clock::now();
     sfm::Reconstruction rec;
@@ -273,6 +304,10 @@ int cmdBa(int argc, char** argv) {
     sfm::RigTable rigs;
     if (is_model) {
         sfm::BundleOptions bopt;
+        bool fix_intrinsics = false;
+#ifdef SS_TOOL_TRAIN
+        sfm::PosePriors priors;
+#endif
         if (!loss_given) { loss = bopt.loss; opt.loss_param = bopt.loss_param; }
         try {
             rec = sfm::Reconstruction::readBinary(file);
@@ -295,13 +330,50 @@ int cmdBa(int argc, char** argv) {
         bopt.device = opt.device;
         bopt.device_selector = opt.device_selector;
         if (!rigs.empty()) bopt.rigs = &rigs;
-        layout = sfm::buildBundle(rec, bopt);
+#ifdef SS_TOOL_TRAIN
+        if (!lidar_positions.empty()) {
+            std::map<std::string, sfm::Vec3> positions;
+            std::string error;
+            if (!sfm::readMetricPositions(lidar_positions, positions, error))
+                throw std::runtime_error(error);
+            for (const auto& [id, image] : rec.images) {
+                if (!image.registered) continue;
+                std::string name = image.name;
+                std::replace(name.begin(), name.end(), '\\', '/');
+                const auto it = positions.find(name);
+                if (it == positions.end()) continue;
+                sfm::PriorCentre prior;
+                prior.n = 1;
+                prior.img[0] = id;
+                prior.b = it->second;
+                prior.sigma = {0.05, 0.05, 0.05};
+                priors.centres.push_back(prior);
+            }
+            if (priors.centres.size() < 3)
+                throw std::runtime_error("LiDAR position priors matched fewer than three registered images");
+            bopt.priors = &priors;
+            fix_intrinsics = true;
+        }
+#endif
+        layout = sfm::buildBundle(rec, bopt, fix_intrinsics);
+        layout.attachPriors();
         if (layout.P.num_images < 2) {
             fprintf(stderr, "spirula-sfm ba: error: %s holds no registered model\n", file.c_str());
             return 1;
         }
         fprintf(stderr, "[model] %u images, %u points, %u observations\n", layout.P.num_images,
                 layout.P.num_points, layout.P.num_obs);
+#ifdef SS_TOOL_TRAIN
+        if (fix_intrinsics)
+            std::fprintf(stderr, "[lidar] %zu camera centre priors (sigma 0.05 m), fixed intrinsics\n",
+                         layout.priors.centres.size());
+        if (!lidar_scan.empty()) {
+            const size_t count = app::lidar::attach_scan_planes(
+                lidar_scan, layout.P.points, lidar_distance, lidar_weight, layout.P.point_planes);
+            if (count == 0) throw std::runtime_error("No LiDAR planes match the model. Check scan alignment.");
+            std::fprintf(stderr, "[lidar] %zu / %u point-to-plane constraints\n", count, layout.P.num_points);
+        }
+#endif
     }
     opt.loss = loss;
     BAProblem P = is_model ? std::move(layout.P) : loadBAL(file, model_id, shared_intr);

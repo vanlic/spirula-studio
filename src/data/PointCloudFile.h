@@ -1,6 +1,6 @@
 #pragma once
 
-// A laser scan's points, whichever file they came in -- E57, LAS or PLY --
+// A laser scan's points, whichever file they came in -- E57, LAS, LAZ or PLY --
 // streamed in batches in the file's own frame, so a 100M-point cloud never has
 // to fit in memory. docs/notes/lidar-alignment.md.
 
@@ -46,6 +46,7 @@ public:
 
 private:
     struct Las;
+    struct Laz;
     struct Ply;
     std::string _path;
     Info _info;
@@ -54,9 +55,7 @@ private:
     std::unique_ptr<Ply> _ply;
 };
 
-// By extension: .e57, .las, .ply (any case). LAZ is recognised so the caller
-// can say why it is refused.
+// By extension: .e57, .las, .laz, .ply (any case).
 bool is_cloud_path(const std::string& path);
-bool is_laz_path(const std::string& path);
 
 }  // namespace spirula::cloud

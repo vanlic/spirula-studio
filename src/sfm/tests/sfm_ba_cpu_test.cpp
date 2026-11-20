@@ -554,9 +554,38 @@ void testFullSolve(uint32_t model, uint32_t groups, uint32_t rig = 0) {
     report(name, relMax(poses[0].data(), poses[1].data(), poses[0].size()), 1e-6);
 }
 
+void testScanPlanes() {
+    BAProblem problem = makeProblem(3, 8, 20, 1, 0.01, 17);
+    SolverOptions options;
+    options.real = RealCfg::CPU;
+    options.loss = "huber";
+    options.max_iters = 12;
+    options.verbose = false;
+    bacpu::Solver visual(problem, options);
+    visual.init();
+    const double before = visual.computeCost();
+
+    const size_t n = problem.num_points;
+    problem.point_planes.resize(4 * n);
+    for (size_t p = 0; p < n; ++p) {
+        problem.point_planes[4 * p + 2] = 10.0;
+        problem.point_planes[4 * p + 3] = 1.0 - 10.0 * problem.points[3 * p + 2];
+    }
+    bacpu::Solver scan(problem, options);
+    scan.init();
+    const double anchored = scan.computeCost();
+    report("LiDAR plane cost", std::abs(anchored - before - 0.5 * n), 1e-9);
+    scan.solve();
+    double error = 0;
+    for (size_t p = 0; p < n; ++p)
+        error += std::abs(10.0 * problem.points[3 * p + 2] + problem.point_planes[4 * p + 3]);
+    report("LiDAR plane residual after BA", error / n, 0.5);
+}
+
 }  // namespace
 
 int run(int argc, char** argv) {
+    testScanPlanes();
     bool quick = false;
     for (int i = 1; i < argc; i++)
         if (std::string(argv[i]) == "--quick") quick = true;

@@ -75,6 +75,7 @@ static const uint kNoMember = 0xFFFFFFFFu;
 [[vk::binding(52)]] RWStructuredBuffer<Real> u_gcam;        // (n_dim) d cost / d column, unreduced
 [[vk::binding(53)]] RWStructuredBuffer<AWord> u_gcam_a;
 [[vk::binding(54)]] RWStructuredBuffer<uint> u_gpt_max;     // (1) max |Bp| as float bits
+[[vk::binding(71)]] StructuredBuffer<Real> u_point_planes;
 
 // Jc and Jp only through the accessors below. kJac32 (Solver.h) keeps them at fp32,
 // rounded where made so every kernel assembles one Jacobian's system; kJc/JpChunk
@@ -219,6 +220,43 @@ void cost_impl<M : ICameraModel, let RIG : int>(uint tid, uint lid) {
     }
     if (lid == 0)
         atomicAccum(u_cost_a, 0, g_sh[0]);
+}
+
+Real planeResidual(uint p) {
+    Real r = u_point_planes[4 * p + 3];
+    for (uint i = 0; i < 3; ++i)
+        r = r + u_point_planes[4 * p + i] * u_points[3 * p + i];
+    return r;
+}
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void plane_cost(uint3 t : SV_DispatchThreadID, uint lid : SV_GroupIndex) {
+    uint p = t.x + u4;
+    Real r = Real(0.0);
+    if (p < u0) r = planeResidual(p);
+    g_sh[lid] = Real(0.5) * r * r;
+    GroupMemoryBarrierWithGroupSync();
+    for (uint stride = kCostWg / 2; stride > 0; stride >>= 1) {
+        if (lid < stride) g_sh[lid] = g_sh[lid] + g_sh[lid + stride];
+        GroupMemoryBarrierWithGroupSync();
+    }
+    if (lid == 0) atomicAccum(u_cost_a, 0, g_sh[0]);
+}
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void plane_linearize(uint3 t : SV_DispatchThreadID) {
+    uint p = t.x + u4;
+    if (p >= u0) return;
+    Real r = planeResidual(p);
+    for (uint i = 0; i < 3; ++i) {
+        Real a = u_point_planes[4 * p + i];
+        uint g = 3 * p + i;
+        u_Bp[g] = u_Bp[g] + a * r;
+        for (uint j = 0; j < 3; ++j) {
+            uint h = 9 * p + 3 * i + j;
+            u_App[h] = u_App[h] + a * u_point_planes[4 * p + j];
+        }
+    }
 }
 
 // =====================================================================

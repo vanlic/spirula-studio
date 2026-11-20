@@ -23,6 +23,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <numeric>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -1165,10 +1166,32 @@ RigTable readRigs(const fs::path& dir, Reconstruction& m) {
 // single-model dataset still writes exactly `sparse/0`.
 void writeModels(std::vector<Reconstruction>& models, const fs::path& dir,
                  bool verbose, const std::vector<ModelGauge>& gauge, const RigTable* rigs) {
+    writeModels(models, dir, verbose, gauge, rigs, nullptr);
+}
+
+void writeModels(std::vector<Reconstruction>& models, const fs::path& dir,
+                 bool verbose, const std::vector<ModelGauge>& gauge, const RigTable* rigs,
+                 std::vector<ReprojectionStats>* reprojection) {
+    if (reprojection) reprojection->assign(models.size(), {});
     for (size_t i = 0; i < models.size(); i++) {
         fs::path p = dir / std::to_string(i);
         fs::create_directories(p);
-        models[i].updatePointErrors();
+        std::vector<double> errors;
+        if (reprojection) errors.reserve(countObservations(models[i]));
+        models[i].updatePointErrors(reprojection ? &errors : nullptr);
+        if (reprojection) {
+            auto& stats = (*reprojection)[i];
+            stats.measured = errors.size();
+            stats.skipped = countObservations(models[i]) - stats.measured;
+            if (!errors.empty()) {
+                stats.mean = std::accumulate(errors.begin(), errors.end(), 0.0) / errors.size();
+                const auto middle = errors.begin() + errors.size() / 2;
+                std::nth_element(errors.begin(), middle, errors.end());
+                stats.max = *std::max_element(middle, errors.end());
+                stats.median = errors.size() % 2 ? *middle
+                             : (*middle + *std::max_element(errors.begin(), middle)) / 2;
+            }
+        }
         models[i].writeBinary(p.string());
         if (i < gauge.size()) writeGauge(p, gauge[i]);
         writeRigs(p, models[i], rigs);

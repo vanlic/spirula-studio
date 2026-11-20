@@ -3699,6 +3699,9 @@ void GuiApp::frame() {
         case Screen::Batch:  draw_batch();  break;
         case Screen::Mesh:   draw_mesh();   break;
     }
+#ifdef SS_TOOL_SFM
+    _pose_survey.draw();
+#endif
     if (_roi_editor.is_open()) _roi_editor.draw();
 
     // A job cancelled by the editor's close finishes its stage off this thread.
@@ -4394,6 +4397,9 @@ bool GuiApp::dataset_busy() const {
            _colmap.state() == ColmapRunner::State::Running;
 }
 bool GuiApp::native_work_busy() const {
+#ifdef SS_TOOL_SFM
+    if (_pose_survey.busy()) return true;
+#endif
     const TrainRunner::Phase phase = _runner.phase();
     return _dense_delete.valid() || _mesh.busy() || dataset_busy() || scan_photos_busy() ||
            phase == TrainRunner::Phase::Loading ||
@@ -5261,7 +5267,7 @@ void GuiApp::draw_dataset_source() {
     if (ui::Button(ldmsg::add_scan)) {
         _pick_lidar = -1;
         open_pick(PickAction::LidarSource, ldmsg::pick_scan.get(), FileDialog::Mode::File,
-                  {".e57", ".las", ".ply"}, "", /*multi_select=*/true);
+                  {".e57", ".las", ".laz", ".ply"}, "", /*multi_select=*/true);
     }
     ui::help_on_hover(ldmsg::add_scan_help);
     if (_sources.empty() && _lidar.empty()) {
@@ -9237,6 +9243,9 @@ void GuiApp::draw_new_dataset() {
     ui::Text(from_video ? dmsg::title_from_video : dmsg::title_from_photos);
     ImGui::SetWindowFontScale(1.0f);
     ImGui::Spacing();
+#ifdef SS_TOOL_SFM
+    _pose_survey.drawButton(_workspace, native_work_busy());
+#endif
 
     // What the run says about itself, read before the layout is decided:
     // whether there is anything to show is what decides whether the screen is

@@ -1,11 +1,13 @@
 #include "core/BufferedFile.h"
 #include "data/PointCloudFile.h"
 
+#include <laszip_api.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -34,30 +36,31 @@ template <class T> T rd(const uint8_t* p) { T v; std::memcpy(&v, p, sizeof v); r
 
 bool is_cloud_path(const std::string& path) {
     const std::string e = lower_ext(path);
-    return e == ".e57" || e == ".las" || e == ".ply";
+    return e == ".e57" || e == ".las" || e == ".laz" || e == ".ply";
 }
-
-bool is_laz_path(const std::string& path) { return lower_ext(path) == ".laz"; }
 
 // ================
 // LAS
 // ================
 
-// ASPRS LAS 1.0-1.4, point formats 0-10, uncompressed. Colour is 16-bit by the
-// standard, but writers disagree on whether they scaled 8-bit values up, so
-// the range is taken from a sample of the file.
-struct Reader::Las {
-    std::ifstream f;
-    uint64_t offset = 0, count = 0;
-    uint32_t record = 0;
+namespace {
+
+struct LasFields {
+    uint64_t count = 0;
     int format = 0;
     double scale[3] = {1, 1, 1}, shift[3] = {0, 0, 0};
     int rgb_at = -1;
     int intensity_shift = 8;   // 16-bit -> byte
     int rgb_shift = 8;
-};
 
-namespace {
+    void unpack(e57::Point& point, const int32_t (&xyz)[3], const uint16_t* color,
+                uint16_t intensity, double gps_time) const {
+        point.gps_time = gps_time;
+        for (int a = 0; a < 3; a++) point.xyz[a] = xyz[a] * scale[a] + shift[a];
+        for (int a = 0; a < 3; a++)
+            point.rgb[a] = (uint8_t)std::min(255, color ? color[a] >> rgb_shift : intensity >> intensity_shift);
+    }
+};
 
 int las_rgb_offset(int format) {
     switch (format) {
@@ -66,6 +69,12 @@ int las_rgb_offset(int format) {
         case 7: case 8: case 10: return 30;
         default: return -1;
     }
+}
+
+int las_time_offset(int format) {
+    if (format >= 6) return 22;
+    if (format == 1 || format == 3 || format == 4 || format == 5) return 20;
+    return -1;
 }
 
 int las_min_record(int format) {
@@ -81,6 +90,50 @@ int shift_for(uint32_t max) {
 }
 
 }  // namespace
+
+struct Reader::Laz : LasFields {
+    std::ifstream f;
+    laszip_POINTER decoder = nullptr;
+    laszip_point_struct* point = nullptr;
+    bool opened = false;
+
+    ~Laz() {
+        if (opened) laszip_close_reader(decoder);
+        if (decoder) laszip_destroy(decoder);
+    }
+
+    void check(laszip_I32 result, const std::string& path) const {
+        if (!result) return;
+        laszip_CHAR* error = nullptr;
+        if (decoder) laszip_get_error(decoder, &error);
+        fail(path, std::string("LASzip: ") + (error ? error : "cannot initialize decoder"));
+    }
+
+    void open(const std::string& path) {
+        f.open(std::filesystem::u8path(path), std::ios::binary);
+        if (!f) fail(path, "cannot open");
+        check(laszip_create(&decoder), path);
+        check(laszip_request_compatibility_mode(decoder, 1), path);
+        laszip_BOOL compressed = 0;
+        check(laszip_open_reader_stream(decoder, f, &compressed), path);
+        opened = true;
+        laszip_header_struct* h = nullptr;
+        check(laszip_get_header_pointer(decoder, &h), path);
+        check(laszip_get_point_pointer(decoder, &point), path);
+        count = h->extended_number_of_point_records ? h->extended_number_of_point_records : h->number_of_point_records;
+        format = h->point_data_format;
+        rgb_at = las_rgb_offset(format);
+        scale[0] = h->x_scale_factor; scale[1] = h->y_scale_factor; scale[2] = h->z_scale_factor;
+        shift[0] = h->x_offset; shift[1] = h->y_offset; shift[2] = h->z_offset;
+    }
+};
+
+struct Reader::Las : LasFields {
+    std::ifstream f;
+    std::unique_ptr<Laz> compressed;
+    uint64_t offset = 0;
+    uint32_t record = 0;
+};
 
 // ================
 // PLY
@@ -140,8 +193,6 @@ uint8_t ply_color(double v, const std::string& t) {
 }  // namespace
 
 Reader::Reader(const std::string& path) : _path(path) {
-    if (is_laz_path(path))
-        fail(path, "LAZ is compressed LAS; decompress it to .las first (laszip, PDAL)");
     const std::string ext = lower_ext(path);
     if (ext == ".e57") {
         _info.format = Format::E57;
@@ -161,18 +212,41 @@ Reader::Reader(const std::string& path) : _path(path) {
         }
         return;
     }
-    if (ext == ".las") {
+    if (ext == ".laz" || ext == ".las") {
         _info.format = Format::Las;
         _las = std::make_unique<Las>();
         Las& L = *_las;
-        L.f.open(path, std::ios::binary);
+        L.f.open(std::filesystem::u8path(path), std::ios::binary);
         if (!L.f) fail(path, "cannot open");
         uint8_t h[375] = {};
         L.f.read((char*)h, sizeof h);
         if (L.f.gcount() < 227 || std::memcmp(h, "LASF", 4) != 0) fail(path, "not a LAS file");
         const int minor = h[25];
         L.offset = rd<uint32_t>(h + 96);
-        if (h[104] & 0xC0) fail(path, "the points are LAZ-compressed; decompress them first");
+        if (ext == ".laz" || (h[104] & 0xC0)) {
+            L.f.close();
+            L.compressed = std::make_unique<Laz>();
+            Laz& Z = *L.compressed;
+            Z.open(path);
+            _info.points = (int64_t)Z.count;
+            uint32_t max_rgb = 0, max_i = 0;
+            const uint64_t spans = std::min<uint64_t>(64, (Z.count + 1023) / 1024);
+            for (uint64_t s = 0; s < spans; s++) {
+                const uint64_t first = Z.count * s / spans;
+                const uint64_t n = std::min<uint64_t>(1024, Z.count - first);
+                Z.check(laszip_seek_point(Z.decoder, first), path);
+                for (uint64_t i = 0; i < n; i++) {
+                    Z.check(laszip_read_point(Z.decoder), path);
+                    max_i = std::max<uint32_t>(max_i, Z.point->intensity);
+                    if (Z.rgb_at >= 0)
+                        for (int c = 0; c < 3; c++) max_rgb = std::max<uint32_t>(max_rgb, Z.point->rgb[c]);
+                }
+            }
+            Z.rgb_shift = shift_for(max_rgb);
+            Z.intensity_shift = shift_for(max_i);
+            _info.has_color = max_rgb > 0;
+            return;
+        }
         L.format = h[104] & 0x3F;
         L.record = rd<uint16_t>(h + 105);
         L.count = rd<uint32_t>(h + 107);
@@ -314,7 +388,7 @@ Reader::Reader(const std::string& path) : _path(path) {
         }
         return;
     }
-    fail(path, "not a point cloud this reads (.e57, .las or .ply)");
+    fail(path, "not a point cloud this reads (.e57, .las, .laz or .ply)");
 }
 
 Reader::~Reader() = default;
@@ -328,8 +402,29 @@ bool Reader::read(const std::function<void(const e57::Point*, size_t)>& sink,
     }
     std::vector<e57::Point> batch;
     batch.reserve(kBatch);
+    if (_las && _las->compressed) {
+        Laz& Z = *_las->compressed;
+        if (!Z.count) return true;
+        Z.check(laszip_seek_point(Z.decoder, 0), _path);
+        const bool has_time = las_time_offset(Z.format) >= 0;
+        for (uint64_t first = 0; first < Z.count;) {
+            if (cancel && cancel->load()) return false;
+            const size_t n = (size_t)std::min<uint64_t>(Z.count - first, kBatch);
+            batch.clear();
+            for (size_t i = 0; i < n; i++) {
+                Z.check(laszip_read_point(Z.decoder), _path);
+                const auto& p = *Z.point;
+                Z.unpack(batch.emplace_back(), {p.X, p.Y, p.Z}, _info.has_color ? p.rgb : nullptr,
+                         p.intensity, has_time ? p.gps_time : 0.0);
+            }
+            sink(batch.data(), batch.size());
+            first += n;
+        }
+        return true;
+    }
     if (_las) {
         Las& L = *_las;
+        const int time_at = las_time_offset(L.format);
         L.f.clear();
         L.f.seekg((std::streamoff)L.offset);
         const size_t rows = std::max<size_t>(1, kFileBufferBytes / L.record);
@@ -344,18 +439,13 @@ bool Reader::read(const std::function<void(const e57::Point*, size_t)>& sink,
             batch.clear();
             for (uint64_t i = 0; i < got; i++) {
                 const uint8_t* p = &buf[i * L.record];
-                e57::Point& o = batch.emplace_back();
-                for (int a = 0; a < 3; a++)
-                    o.xyz[a] = (double)rd<int32_t>(p + 4 * a) * L.scale[a] + L.shift[a];
+                uint16_t rgb[3];
                 if (_info.has_color) {
-                    for (int c = 0; c < 3; c++)
-                        o.rgb[c] = (uint8_t)std::min<uint32_t>(
-                            255, rd<uint16_t>(p + L.rgb_at + 2 * c) >> L.rgb_shift);
-                } else {
-                    const uint8_t g = (uint8_t)std::min<uint32_t>(
-                        255, rd<uint16_t>(p + 12) >> L.intensity_shift);
-                    o.rgb[0] = o.rgb[1] = o.rgb[2] = g;
+                    for (int c = 0; c < 3; c++) rgb[c] = rd<uint16_t>(p + L.rgb_at + 2 * c);
                 }
+                L.unpack(batch.emplace_back(), {rd<int32_t>(p), rd<int32_t>(p + 4), rd<int32_t>(p + 8)},
+                         _info.has_color ? rgb : nullptr, rd<uint16_t>(p + 12),
+                         time_at >= 0 ? rd<double>(p + time_at) : 0.0);
             }
             sink(batch.data(), batch.size());
             left -= got;

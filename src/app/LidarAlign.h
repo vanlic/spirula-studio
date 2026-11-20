@@ -38,6 +38,13 @@ struct AlignCloud {
 AlignCloud make_align_cloud(std::vector<double>& xyz, std::vector<uint8_t>& rgb,
                             int64_t target);
 
+AlignCloud load_scan_planes(const std::string& path);
+
+size_t attach_scan_planes(const AlignCloud& cloud, const std::vector<double>& points,
+                          double max_distance, double weight, std::vector<double>& planes);
+size_t attach_scan_planes(const std::string& path, const std::vector<double>& points,
+                          double max_distance, double weight, std::vector<double>& planes);
+
 // What the alignment reads of a reconstruction: where its cameras are and its
 // points, each with the number of images that see it.
 struct ModelGeometry {

@@ -32,6 +32,7 @@ namespace sfm {
 struct BundleOptions {
     RealCfg real = RealCfg::F64;
     bool fix_rotations = false;
+    bool fix_intrinsics = false;
     int max_iters = 25;
     bool verbose = false;
     // Canonical uuid:<hex> of the device this solve runs on; "" = the shared
@@ -167,7 +168,8 @@ inline Pose unpackPose(const double* v) {
 
 // Pack `rec` into a BAProblem. Empty layout (num_images < 2) if there is
 // nothing to optimize.
-inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) {
+inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt,
+                                bool fix_intrinsics = false) {
     // Index registered images and 3D points.
     //
     // Everything downstream addresses them by their dense BA index, so the
@@ -341,7 +343,8 @@ inline BundleLayout buildBundle(Reconstruction& rec, const BundleOptions& bopt) 
         const Camera& c = rec.cameras[camIds[g]];
         const bool pp = bopt.refine_principal_point && bopt.refine_extra_params &&
                         group_images[g] >= bopt.pp_min_images;
-        uint32_t nf = (uint32_t)camNumFreeParams(c.model, pp, bopt.refine_extra_params);
+        uint32_t nf = (fix_intrinsics || bopt.fix_intrinsics) ? 0u
+                      : (uint32_t)camNumFreeParams(c.model, pp, bopt.refine_extra_params);
         uint32_t off = (uint32_t)P.intr.size();
         uint32_t ni = (uint32_t)camNumParams(c.model);
         double ps[12];
@@ -464,6 +467,7 @@ struct BundleRun {
     SolverStats stats;
     RealCfg real = RealCfg::F64;  // what the solve that finished ran in
     double t_init = 0, t_solve = 0;
+    uint32_t pose_blocks = 0, rig_dof = 0, intrinsic_dof = 0;
 };
 
 // Solve `P` in place, on the host from the device's last checkpoint if the
@@ -472,6 +476,9 @@ struct BundleRun {
 inline BundleRun solveBundle(BAProblem& P, SolverOptions sopt, VkContext* shared,
                              const std::function<BAProblem()>& rebuild = {}) {
     BundleRun r;
+    r.pose_blocks = P.num_frames;
+    r.rig_dof = P.ext_dim;
+    r.intrinsic_dof = P.free_intr;
     if (P.num_obs >= baHostObsThreshold().load()) sopt.real = RealCfg::CPU;
     SolverCheckpoint ck;
     sopt.checkpoint = &ck;
@@ -501,6 +508,7 @@ inline BundleRun solveBundle(BAProblem& P, SolverOptions sopt, VkContext* shared
             fresh.exts = std::move(P.exts);
             fresh.intr = std::move(P.intr);
             fresh.points = std::move(P.points);
+            fresh.point_planes = std::move(P.point_planes);
             fresh.priors = P.priors;
             P = std::move(fresh);
         }
@@ -521,7 +529,9 @@ inline BundleRun solveBundle(BAProblem& P, SolverOptions sopt, VkContext* shared
 // Global BA over all registered images and all 3D points. Overwrites poses,
 // point positions, and intrinsics in `rec`. Returns the final RMS reprojection
 // cost reported by the solver (0 if nothing to optimize).
-inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt) {
+inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt,
+                          const std::function<void(BAProblem&)>& prepare = {},
+                          BundleRun* result = nullptr) {
     auto prof_t0 = std::chrono::steady_clock::now();
     auto prof_lap = [&prof_t0] {
         auto t1 = std::chrono::steady_clock::now();
@@ -533,10 +543,12 @@ inline double runGlobalBA(Reconstruction& rec, const BundleOptions& bopt) {
     L.attachPriors();
     BAProblem& P = L.P;
     if (P.num_images < 2) return 0;
+    if (prepare) prepare(P);
     double t_build = prof_lap();
 
     const BundleRun run = solveBundle(P, bundleSolverOptions(bopt), bopt.shared_ctx,
                                       [&] { return buildBundle(rec, bopt).P; });
+    if (result) *result = run;
     const SolverStats& stats = run.stats;
     const double t_init = run.t_init, t_solve = run.t_solve;
     prof_lap();

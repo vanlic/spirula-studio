@@ -90,7 +90,7 @@ jobs:
             *) VERSION=$(git rev-parse --short=7 HEAD) ;;
           esac
           ASSET=spirula-$VERSION-ubuntu-vulkan-x86_64.zip
-          zip -j "$ASSET" build_vulkan/spirula
+          zip -j "$ASSET" build_vulkan/spirula build_vulkan/LASzip-LICENSE.txt
           echo "ASSET=$ASSET" >> "$GITHUB_ENV"
 
       - uses: actions/upload-artifact@v7
@@ -176,7 +176,7 @@ jobs:
         run: |
           $version = if ($env:GITHUB_REF -like 'refs/tags/v*') { $env:REF_NAME.Substring(1) } else { git rev-parse --short=7 HEAD }
           $asset = "spirula-$version-windows-vulkan-x86_64.zip"
-          Compress-Archive -Path build_vulkan\spirula.exe -DestinationPath $asset
+          Compress-Archive -Path build_vulkan\spirula.exe,build_vulkan\LASzip-LICENSE.txt -DestinationPath $asset
           "ASSET=$asset" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v7

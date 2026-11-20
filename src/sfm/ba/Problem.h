@@ -62,6 +62,8 @@ struct BAProblem {
     // Camera-side priors on the poses (sfm/ba/Priors.h), on BA image indices;
     // null or empty leaves both solvers exactly as they were.
     const sfm::PosePriors* priors = nullptr;
+    // Per point (w*n, w*d). A zero row has no associated scan plane.
+    std::vector<double> point_planes;
     // Pose blocks. Without rigs num_frames == num_images and image_frame is
     // the identity; with them, images must be ordered by frame (finalizeTables
     // checks), which is what lets the host solver own a frame's rows per task.

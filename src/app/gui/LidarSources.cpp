@@ -205,7 +205,7 @@ void GuiApp::draw_lidar_rows(float path_w, bool one_line) {
         if (ui::Button(dmsg::browse)) {
             _pick_lidar = (int)i;
             open_pick(PickAction::LidarSource, ldmsg::pick_scan.get(), FileDialog::Mode::File,
-                      {".e57", ".las", ".ply"});
+                      {".e57", ".las", ".laz", ".ply"});
         }
         ImGui::SameLine();
         if (ui::Button(dmsg::remove)) remove = (int)i;

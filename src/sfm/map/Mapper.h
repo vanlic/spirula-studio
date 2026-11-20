@@ -383,6 +383,19 @@ struct MapperOptions {
     std::string spill_dir;
 };
 
+struct MetricPoseBaStage {
+    const char* name = "";
+    bool fix_intrinsics = false;
+    bool refine_rigs = false;
+    int rounds = 0, max_iters = 0;
+    double loss_param = 2.0;
+    double reproj_error = 3.0;
+    bool rebuild_tracks = false;
+    std::function<void(BAProblem&)> prepare;
+    int solves = 0;
+    BundleRun last;
+};
+
 class Mapper {
 public:
     // `camera_ids[i]` is the (1-based) camera image i belongs to (empty = one
@@ -833,6 +846,59 @@ public:
     void bootstrapCameras() {
         ensureSetup();
         bootstrapFocalLength();
+    }
+
+    Reconstruction fromMetricPoses(const std::map<uint32_t, Pose>& poses,
+                                   std::vector<MetricPoseBaStage>& stages) {
+        ensureSetup();
+        resetModel();
+        for (const auto& [id, pose] : poses) {
+            Image& image = rec_.images.at(id);
+            image.pose = pose;
+            image.registered = true;
+        }
+        if (rigs_) {
+            for (size_t r = 0; r < rigs_->rigs.size(); ++r) {
+                const auto& spec = rigs_->rigs[r];
+                RigCalib& calib = rec_.rigs[r];
+                if (calib.ref < 0) continue;
+                const Pose base = invertPose(spec.members[calib.ref].ext);
+                for (size_t m = 0; m < spec.members.size(); ++m) {
+                    const RigMemberDef& member = spec.members[m];
+                    if (!member.has_ext) continue;
+                    calib.cam_from_rig[m] = composePose(member.ext, base);
+                    calib.established[m] = 1;
+                    calib.fixed[m] = member.ext_fixed || member.dof == kRigDofNone;
+                }
+            }
+        }
+        const double normal_error = opt_.max_reproj_error;
+        for (size_t i = 0; i < stages.size(); ++i) {
+            auto& stage = stages[i];
+            opt_.max_reproj_error = stage.reproj_error;
+            if (stage.rebuild_tracks) {
+                rec_.points3D.clear();
+                rec_.next_point3D_id = 1;
+                scale_cache_ = 0;
+                for (auto& [id, image] : rec_.images)
+                    std::fill(image.point3D_ids.begin(), image.point3D_ids.end(), kInvalidPoint3D);
+            }
+            rebuildScores();
+            completeAndRetriangulate(i == 0 || stage.rebuild_tracks ? 1.0 : opt_.retri_scale);
+            if (rec_.points3D.size() < 10)
+                throw std::runtime_error(std::string("Too few triangulated points for survey BA: ") + stage.name);
+            if (opt_.verbose)
+                std::printf("[survey-ba] %s: rig %s, intrinsics %s\n", stage.name,
+                            stage.refine_rigs ? "free" : "held", stage.fix_intrinsics ? "held" : "free");
+            globalRefine(true, false, &stage);
+            if (i == 0) {
+                MetricPoseBaStage growth = stage;
+                growth.rounds = 0;
+                growLoop(0, false, &growth);
+            }
+        }
+        opt_.max_reproj_error = normal_error;
+        return snapshotModel();
     }
 
     // Adopt and bundle-adjust, with the mapper's own filtering and
@@ -2992,7 +3058,8 @@ private:
     // to trigger one. The caller is then responsible for the optimization --
     // see growByPnP, where a whole level's worth of growth is paid for by a
     // single joint bundle adjustment rather than one per model.
-    uint32_t growLoop(uint32_t max_reg = 0, bool stop_at_ba = false) {
+    uint32_t growLoop(uint32_t max_reg = 0, bool stop_at_ba = false,
+                      MetricPoseBaStage* metric_stage = nullptr) {
         uint32_t registered_here = 0;
         // Relative to what the model already holds, not absolute. 3 is right
         // for a two-image seed and wrong for every continuation: an adopted
@@ -3080,7 +3147,7 @@ private:
                     gps_in_since_ba_ = false;
                 }
                 if (stop_at_ba) break;
-                checkedRefine(false);
+                checkedRefine(false, metric_stage);
                 // Refinement mutates observations wholesale (filtering,
                 // retriangulation, de-registration, possibly a snapshot
                 // restore), so the incremental score cache starts over.
@@ -3149,7 +3216,7 @@ private:
     // Transactional global refinement (D36): one toxic registration can bend a
     // small model until the filters shred it. If refinement collapses the model,
     // restore the snapshot and de-register the images added since the last one.
-    void checkedRefine(bool final_pass) {
+    void checkedRefine(bool final_pass, MetricPoseBaStage* metric_stage = nullptr) {
         uint32_t reg_before = rec_.numRegistered();
         Snapshot snap;
         {
@@ -3157,7 +3224,7 @@ private:
             snap = takeSnapshot();
         }
         try {
-            globalRefine(final_pass);
+            globalRefine(final_pass, false, metric_stage);
         } catch (const Cancelled&) {
             throw;
         } catch (const std::exception& e) {
@@ -5437,12 +5504,14 @@ private:
 
 
     // Completion uses a stricter threshold than filtering to avoid observation churn.
-    void globalRefine(bool final_pass, bool fixed_rotation_stage = false) {
+    void globalRefine(bool final_pass, bool fixed_rotation_stage = false,
+                      MetricPoseBaStage* metric_stage = nullptr) {
         std::unordered_set<uint64_t> welded;
         welded.swap(welded_);
         if (rec_.numRegistered() < 2 || rec_.points3D.size() < 10) return;
         const bool tight = final_pass && opt_.ba_final_tight;
-        int rounds = tight ? opt_.ba_max_refinements : 2;
+        int rounds = metric_stage && metric_stage->rounds > 0 ? metric_stage->rounds
+                     : tight ? opt_.ba_max_refinements : 2;
         refine_rounds_ = 0;
         for (int i = 0; i < rounds; i++) {
             refine_rounds_ = i + 1;
@@ -5464,7 +5533,9 @@ private:
             bo.threads = opt_.threads;
             bo.verbose = false;
             bo.loss = opt_.ba_loss;
-            bo.loss_param = (float)(opt_.ba_loss_param * medianPixelScale());
+            bo.loss_param = (float)((metric_stage ? metric_stage->loss_param : opt_.ba_loss_param) *
+                                    medianPixelScale());
+            bo.fix_intrinsics = metric_stage && metric_stage->fix_intrinsics;
             bo.refine_principal_point = opt_.refine_principal_point || final_.pp;
             bo.refine_extra_params = opt_.refine_extra_params || final_.extra;
             bo.pp_min_images = opt_.pp_min_images;
@@ -5481,7 +5552,8 @@ private:
             bo.over_budget_throws = ba_over_budget_throws_;
             bo.rigs = rigs_;
             bo.use_rigs = !final_.no_rig;
-            bo.refine_rigs = opt_.refine_rigs && rigRefineDue(tight && i == 0);
+            bo.refine_rigs = metric_stage ? metric_stage->refine_rigs
+                                         : opt_.refine_rigs && rigRefineDue(tight && i == 0);
             if (rigs_ && !final_.no_rig) calibrateRigs(rec_);
             PosePriors pf;
             if (priors_) {
@@ -5499,17 +5571,22 @@ private:
                         bo.metres_per_unit = std::sqrt(A[0] * A[0] + A[3] * A[3] + A[6] * A[6]);
                 }
             }
+            if (metric_stage && metric_stage->max_iters > 0) bo.max_iters = metric_stage->max_iters;
             if (fixed_rotation_stage) {
                 BundleOptions fixed = bo;
                 fixed.fix_rotations = true;
                 runGlobalBA(rec_, fixed);
             }
-            double cost = runGlobalBA(rec_, bo);
+            double cost;
+            if (metric_stage) {
+                cost = runGlobalBA(rec_, bo, metric_stage->prepare, &metric_stage->last);
+                ++metric_stage->solves;
+            } else cost = runGlobalBA(rec_, bo);
             if (rigs_ && !final_.no_rig) snapRigFrames();
             ProfTimer pt(g_map_prof.filter);
             // Unbounded distortion can flatten a model while keeping residuals low.
             // Disabling sanitization took AUC@10 from 84.3 to 0.0 on an 811-image capture.
-            if (!final_.no_sanitize) sanitizeCameras();
+            if (!final_.no_sanitize && !bo.fix_intrinsics) sanitizeCameras();
             int removedObs = 0, removedPts = 0;
             filterPoints(removedObs, removedPts, weld_round ? &welded : nullptr);
             if (opt_.verbose) {
@@ -5528,7 +5605,9 @@ private:
             const size_t changed = removedObs + (complete_first ? track_changes : 0);
             const bool converged = !before || (double)changed / (double)before <=
                                                    opt_.ba_refine_change;
-            if (converged && refine_rounds_ >= std::max(1, final_.min_rounds)) break;
+            const int min_rounds = metric_stage && metric_stage->rounds > 0 ? std::min(2, rounds)
+                                 : std::max(1, final_.min_rounds);
+            if (converged && refine_rounds_ >= min_rounds) break;
         }
         int dropped;
         {
@@ -5673,9 +5752,13 @@ private:
 
     // Hysteresis keeps borderline observations from being removed and recreated each round.
     size_t completeAndRetriangulate() {
+        return completeAndRetriangulate(opt_.retri_scale);
+    }
+
+    size_t completeAndRetriangulate(double reproj_scale) {
         const size_t before = countObservations();
         size_t completed = 0, merged = 0;
-        const double err = opt_.retri_scale * opt_.max_reproj_error;  // x pixel_scale below
+        const double err = reproj_scale * opt_.max_reproj_error;  // x pixel_scale below
         ModelIndex mi = indexModel();
         std::vector<std::pair<uint64_t, Point3D*>> pts;
         pts.reserve(rec_.points3D.size());
@@ -5716,16 +5799,16 @@ private:
                 for (size_t i = lo; i < hi; i++) {
                     made[i].resize(1);
                     for (uint32_t f = 0; f < feats_[imgs[i]].count(); f++)
-                        if (featureTrack(mi, imgs[i], f, opt_.retri_scale, obs, t, &rays))
+                        if (featureTrack(mi, imgs[i], f, reproj_scale, obs, t, &rays))
                             made[i][0].push_back(t);
                 }
             });
         }
         for (size_t i = 0; i < imgs.size(); i++)
-            commitCollected(mi, imgs[i], made[i], opt_.retri_scale);
+            commitCollected(mi, imgs[i], made[i], reproj_scale);
         if (opt_.merge_tracks) {
             ProfTimer pt(g_map_prof.merge);
-            merged = mergeTracks(mi, opt_.retri_scale);
+            merged = mergeTracks(mi, reproj_scale);
             g_map_prof.n_merged += merged;
         }
         if (MapProf::enabled()) g_map_prof.track_completed += completed;

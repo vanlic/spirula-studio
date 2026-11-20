@@ -70,6 +70,7 @@ struct Scan {
 struct Point {
     double xyz[3];
     uint8_t rgb[3];
+    double gps_time = 0.0;
 };
 
 class Reader {

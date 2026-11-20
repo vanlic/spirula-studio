@@ -69,6 +69,9 @@
 
 // `spirula-sfm ba`, in sfm_ba.cpp. It prints its own help.
 int cmdBa(int argc, char** argv);
+#ifdef SS_TOOL_TRAIN
+namespace app::survey { int runCommand(int argc, char** argv); }
+#endif
 void printBaHelp(FILE* out);
 
 // Set by the build (cmake/SsOptions.cmake reads it from pyproject.toml).
@@ -1306,6 +1309,9 @@ int spirula_sfm_main(int argc, char** argv) {
         if (cmd == "map") return cmdMap(argc - 2, argv + 2);
         if (cmd == "merge") return cmdMerge(argc - 2, argv + 2);
         if (cmd == "ba") return cmdBa(argc - 2, argv + 2);
+#ifdef SS_TOOL_TRAIN
+        if (cmd == "survey") return app::survey::runCommand(argc - 2, argv + 2);
+#endif
     } catch (const sfm::Cancelled&) {
         L::err(Tag::Run, M::run_cancelled);
         return 130;   // the shell's convention for SIGINT, 128 + 2

@@ -40,6 +40,8 @@ public:
     Solver(BAProblem& P, const SolverOptions& opt) : P_(P), opt_(opt) {}
 
     void init() {
+        if (!P_.point_planes.empty() && P_.point_planes.size() != 4 * size_t(P_.num_points))
+            throw std::runtime_error("BA point planes must have four coefficients per point");
         n_ = P_.n_dim;
         poseDim_ = P_.pose_dim;
         nImg_ = P_.num_images;
@@ -98,6 +100,12 @@ public:
             });
         });
         for (double v : part_) total += v;
+        for (size_t p = 0; p < P_.point_planes.size() / 4; ++p) {
+            const double* a = &P_.point_planes[4 * p];
+            const double* x = &P_.points[3 * p];
+            const double r = a[0] * x[0] + a[1] * x[1] + a[2] * x[2] + a[3];
+            total += 0.5 * r * r;
+        }
         lastPrior_ = hasPriors_ ? prior_.cost(P_, P_.poses.data(), P_.exts.data()) : 0.0;
         return total + lastPrior_;
     }
@@ -716,6 +724,16 @@ private:
                             }
                             const double bv = jp[i] * r[0] + jp[3 + i] * r[1];
                             if (std::isfinite(bv)) Bp[i] += bv;
+                        }
+                    }
+                    if (!P_.point_planes.empty()) {
+                        const double* a = &P_.point_planes[4 * (size_t)p];
+                        const double* x = &P_.points[3 * (size_t)p];
+                        const double r = a[0] * x[0] + a[1] * x[1] + a[2] * x[2] + a[3];
+                        for (int i = 0; i < 3; ++i) {
+                            Bp[i] += a[i] * r;
+                            for (int j = 0; j < 3; ++j)
+                                App[3 * i + j] += a[i] * a[j];
                         }
                     }
                     memcpy(&App_[9 * (size_t)p], App, sizeof App);

@@ -23,6 +23,7 @@
 #include "app/gui/MatchMatrixEditor.h"
 #include "app/gui/PickSheet.h"
 #include "app/gui/ProgressClock.h"
+#include "app/gui/PoseSurveyPanel.h"
 #include "app/gui/RunMemoryView.h"
 #include "app/gui/PickSheetView.h"
 #include "app/gui/PairPreview.h"
@@ -1010,6 +1011,9 @@ private:
     // Selectable highlight behind an input row, sized from the last frame.
     bool row_select_begin(float last_h, bool selected);
     std::string _workspace;
+#ifdef SS_TOOL_SFM
+    PoseSurveyPanel _pose_survey;
+#endif
     // The output folder this screen derived from the inputs. Kept so a folder
     // the user typed is never overwritten when the input list changes.
     std::string _workspace_auto;

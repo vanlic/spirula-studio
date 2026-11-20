@@ -65,6 +65,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp "$EXE" "$APP/Contents/MacOS/spirula"
+cp "$BUILD_DIR/LASzip-LICENSE.txt" "$APP/Contents/Resources/"
 
 # A regional build (SS_FONT_CJK=sc|tc|jp|kr|all) ships its face beside the
 # executable, and inside the bundle that is Contents/MacOS.

@@ -1,6 +1,6 @@
 # Aligning a reconstruction with a laser scan
 
-A laser scan (E57, LAS or PLY) is an input of the dataset screen, next to
+A laser scan (E57, LAS, LAZ or PLY) is an input of the dataset screen, next to
 photos and videos, and there may be several. The reconstruction runs as
 usual; then `spirula lidar` moves it into the scans' frame with a similarity
 -- rotation, translation and scale, any extrinsics -- and writes it back as
@@ -13,6 +13,73 @@ Code: `data/PointCloudFile.h` (the reader), `app/LidarAlign.h` (the fit and
 the scans' frames), `app/LidarDataset.h` (the dataset),
 `app/cli/lidar_main.cpp` (`spirula lidar`), `app/gui/LidarStep.h` and
 `app/gui/LidarSources.cpp` (the GUI).
+
+## Point-to-plane BA
+
+For an already aligned COLMAP model, the optional point-to-plane BA fits
+sparse landmarks to a scan in the same metre frame.
+
+```bash
+spirula sfm ba sparse/0 sparse/lidar --lidar-scan scan.las
+```
+
+The BA associates visible landmarks with the nearest scan point inside
+`--lidar-distance` (default 0.25 m) and uses its local PCA plane. It adds one
+weighted signed distance per association to the same solve as reprojection.
+`--lidar-weight` in BA multiplies the residual in pixels per metre.
+Pass `--lidar-positions camera-centres.txt` to keep the input calibration and
+add camera centre priors with a 5 cm standard deviation. The file has one
+`image_name X Y Z` record per camera in the same metre frame.
+
+## Reconstruct from known poses
+
+On the New Dataset screen, open **Reconstruct from known poses**. Choose the
+image root and a folder for the output. Add one pose table per camera folder,
+or use full relative image names in a shared table. CSV, tab-separated, and
+whitespace-separated tables can carry extra columns. Map the image name or
+frame number, `qx qy qz qw`, and `x y z`; select which direction the transform
+takes. Camera-to-world translation is the camera centre, in metres.
+
+For a dual fisheye, supply a text file whose first data row is
+`tx ty tz qx qy qz qw` from the first camera's axes into the second camera's.
+Pairs share the same relative filename stem. The known transform is held in
+the first BA stage. Later stages optimize one transform shared across all
+paired frames. Either member's input pose can locate the other.
+
+The optional **Camera intrinsics TXT** takes one row per lens. Use the image
+subfolder, the COLMAP camera model, and its parameters in COLMAP order at the
+original image resolution. For `OPENCV_FISHEYE`, the parameters are
+`fx fy cx cy k1 k2 k3 k4`. For `THIN_PRISM_FISHEYE`, append the distortion
+in the order `k1 k2 p1 p2 k3 k4 sx1 sy1` after `fx fy cx cy`. Lines starting
+with `#` are comments. The two rows below use 2880 × 2880 inputs.
+
+```text
+0 OPENCV_FISHEYE 785 785 1440 1440 0 0 0 0
+1 OPENCV_FISHEYE 785 785 1440 1440 0 0 0 0
+```
+
+Replace the example numbers with the device's calibration. With a TXT file,
+BA holds intrinsics in the first two stages and optimizes them in the final
+stage. If enabled, scan planes join that same final solve. With an empty
+calibration field, SfM estimates intrinsics from the images and can refine
+them from the first stage. This path uses 5 cm quadratic camera-center
+priors. An optional scan pass follows it with the refined calibration held.
+
+Both fisheye and detail photos go under the image root. Select the detail
+photo subfolder to use a perspective camera model there and register those
+photos against the same metric reconstruction. With **Replace covered fisheye
+views**, a fisheye must share enough reconstructed points with registered
+detail photos, both overall and across its populated image regions. This
+filters the exported model's image list, while source photos remain on disk.
+
+An optional LAS, LAZ, E57 or PLY scan in the same coordinate frame supplies planes
+to the final BA when selected.
+The output is a training dataset. `sparse/0` names its registered photos
+relative to `images/`, and supplied masks for those photos go into `masks/`.
+Files use hard links on the same filesystem and copies when links are unavailable.
+Identical files already in the output are reused. `ba_report.json` records the
+settings, registered image count and mean, maximum and median reprojection error
+in source-image pixels across observations in the exported model.
 
 ## The pipeline
 
@@ -126,9 +193,8 @@ taken for it. Every case above was exercised on the FJD workspace
 
 - **E57**: PR 101's reader. Scan poses are stations when there are several or
   one is not the identity (a mobile scan's single pose says nothing).
-- **LAS** 1.0-1.4, point formats 0-10, uncompressed. Colour is 16-bit by the
-  standard but writers disagree on scaling, so the shift is taken from 64
-  spans of the file. LAZ is refused with a message.
+- **LAS/LAZ**, point formats 0-10. LASzip decodes LAZ in batches. The reader
+  samples up to 64 spans to detect how the writer scaled colour into 16 bits.
 - **PLY**, ascii or binary, streamed. A `camera` element (PCL, ETH3D) gives
   the scanner's position; NavVis writes one at the origin, which is where its
   walk began. Dropped on the dataset screen, or together with
