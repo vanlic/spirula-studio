@@ -4,6 +4,7 @@
 #include "app/PoseSurvey.h"
 #include "app/gui/CommandRunner.h"
 #include "app/gui/FileDialog.h"
+#include "i18n/Message.h"
 
 namespace gui {
 
@@ -20,7 +21,7 @@ private:
         std::string error;
         void preview();
     };
-    bool pathRow(const char* label, std::string& path, FileDialog::Mode mode,
+    bool pathRow(const spirula::i18n::Msg& label, std::string& path, FileDialog::Mode mode,
                  const std::vector<std::string>& extensions = {}, bool relative = false);
     void start();
 

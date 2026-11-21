@@ -2,10 +2,8 @@
 
 #ifdef SS_TOOL_SFM
 #include "app/AppPaths.h"
+#include "app/gui/Ui.h"
 #include "i18n/catalog/PoseSurvey.h"
-
-#include "imgui.h"
-#include "imgui_stdlib.h"
 
 #include <algorithm>
 #include <cctype>
@@ -38,17 +36,17 @@ void PoseSurveyPanel::Table::preview() {
     }
 }
 
-bool PoseSurveyPanel::pathRow(const char* label, std::string& path, FileDialog::Mode mode,
+bool PoseSurveyPanel::pathRow(const ui::Msg& label, std::string& path, FileDialog::Mode mode,
                               const std::vector<std::string>& extensions, bool relative) {
     ImGui::PushID(&path);
-    ImGui::TextUnformatted(label);
+    ui::Text(label);
     ImGui::SetNextItemWidth(-ImGui::CalcTextSize(M::browse.get()).x -
                             2.0f * ImGui::GetStyle().FramePadding.x - ImGui::GetStyle().ItemSpacing.x);
-    ImGui::InputText("##path", &path);
+    ui::InputTextRaw("##path", &path);
     const bool edited = ImGui::IsItemDeactivatedAfterEdit();
     ImGui::SameLine();
-    if (ImGui::Button(M::browse.get())) {
-        picker_.open(label, mode, extensions, images_);
+    if (ui::Button(M::browse)) {
+        picker_.open(label.get(), mode, extensions, images_);
         pick_target_ = &path;
         relative_pick_ = relative;
     }
@@ -58,8 +56,7 @@ bool PoseSurveyPanel::pathRow(const char* label, std::string& path, FileDialog::
 
 void PoseSurveyPanel::drawButton(const std::string& workspace, bool disabled) {
     ImGui::BeginDisabled(disabled);
-    const std::string button = std::string(M::title.get()) + "###pose_survey_open";
-    if (ImGui::Button(button.c_str())) {
+    if (ui::Button(M::title)) {
         open_ = true;
         if (!workspace.empty() && images_.empty()) {
             std::error_code ec;
@@ -119,11 +116,11 @@ void PoseSurveyPanel::draw() {
         return;
     }
     ImGui::BeginDisabled(runner_.busy() || picker_.is_open());
-    pathRow(M::images.get(), images_, FileDialog::Mode::Folder);
-    pathRow(M::output.get(), output_, FileDialog::Mode::Folder);
-    pathRow(M::masks.get(), masks_, FileDialog::Mode::Folder);
+    pathRow(M::images, images_, FileDialog::Mode::Folder);
+    pathRow(M::output, output_, FileDialog::Mode::Folder);
+    pathRow(M::masks, masks_, FileDialog::Mode::Folder);
     ImGui::BeginDisabled(!intrinsics_.empty());
-    ImGui::InputFloat(M::focal.get(), &focal_, 0, 0, "%.1f");
+    ui::InputFloat(M::focal, &focal_, 0, 0, "%.1f");
     ImGui::EndDisabled();
 
     bool valid = !images_.empty() && !output_.empty() && (!intrinsics_.empty() || focal_ >= 0);
@@ -132,16 +129,16 @@ void PoseSurveyPanel::draw() {
         Table& row = tables_[i];
         ImGui::PushID(int(i));
         ImGui::Separator();
-        if (pathRow(M::pose_file.get(), row.input.file, FileDialog::Mode::File, {".csv", ".txt", ".tsv"})) row.preview();
-        if (ImGui::Checkbox(M::header.get(), &row.input.header)) row.preview();
+        if (pathRow(M::pose_file, row.input.file, FileDialog::Mode::File, {".csv", ".txt", ".tsv"})) row.preview();
+        if (ui::Checkbox(M::header, &row.input.header)) row.preview();
         int direction = row.input.world_to_camera ? 1 : 0;
-        const char* directions[] = {M::camera_to_world.get(), M::world_to_camera.get()};
-        if (ImGui::Combo("##direction", &direction, directions, 2)) row.input.world_to_camera = direction == 1;
-        pathRow(M::camera.get(), row.input.camera, FileDialog::Mode::Folder, {}, true);
-        if (!row.error.empty()) ImGui::TextWrapped("%s", row.error.c_str());
+        if (ui::ComboRaw("##direction", &direction, {&M::camera_to_world, &M::world_to_camera}))
+            row.input.world_to_camera = direction == 1;
+        pathRow(M::camera, row.input.camera, FileDialog::Mode::Folder, {}, true);
+        if (!row.error.empty()) ui::TextWrappedRaw(row.error);
         valid = valid && row.error.empty() && !row.input.file.empty() && row.columns.size() >= 8;
         if (row.columns.size() >= 8) {
-            const char* roles[] = {M::image_id.get(), "qx", "qy", "qz", "qw", "x", "y", "z"};
+            const char* roles[] = {"", "qx", "qy", "qz", "qw", "x", "y", "z"};
             if (ImGui::BeginTable("##mapping", 2, ImGuiTableFlags_SizingStretchSame)) {
                 for (int k = 0; k < 8; ++k) {
                     ImGui::TableNextColumn();
@@ -149,10 +146,10 @@ void PoseSurveyPanel::draw() {
                     valid = valid && col >= 0 && size_t(col) < row.columns.size();
                     const char* preview = col >= 0 && size_t(col) < row.columns.size() ? row.columns[col].c_str() : "";
                     ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x * 0.72f);
-                    if (ImGui::BeginCombo(roles[k], preview)) {
+                    if (k == 0 ? ui::BeginCombo(M::image_id, preview) : ui::BeginComboRaw(roles[k], preview)) {
                         for (size_t j = 0; j < row.columns.size(); ++j) {
                             ImGui::PushID(int(j));
-                            if (ImGui::Selectable(row.columns[j].c_str(), col == int(j))) col = int(j);
+                            if (ui::SelectableRaw(row.columns[j], col == int(j))) col = int(j);
                             ImGui::PopID();
                         }
                         ImGui::EndCombo();
@@ -162,45 +159,44 @@ void PoseSurveyPanel::draw() {
             }
             valid = valid && std::set<int>(row.input.columns.begin(), row.input.columns.end()).size() == 8;
         }
-        if (tables_.size() > 1 && ImGui::Button(M::remove_pose.get()) && !picker_.is_open()) remove = int(i);
+        if (tables_.size() > 1 && ui::Button(M::remove_pose) && !picker_.is_open()) remove = int(i);
         ImGui::PopID();
     }
     if (remove >= 0) tables_.erase(tables_.begin() + remove);
-    if (ImGui::Button(M::add_pose.get()) && !picker_.is_open()) tables_.emplace_back();
+    if (ui::Button(M::add_pose) && !picker_.is_open()) tables_.emplace_back();
     ImGui::Separator();
-    pathRow(M::scan.get(), scan_, FileDialog::Mode::File, {".las", ".laz", ".e57", ".ply"});
+    pathRow(M::scan, scan_, FileDialog::Mode::File, {".las", ".laz", ".e57", ".ply"});
     ImGui::BeginDisabled(scan_.empty());
-    ImGui::Checkbox(M::plane.get(), &plane_);
+    ui::Checkbox(M::plane, &plane_);
     ImGui::EndDisabled();
-    ImGui::TextWrapped("%s", M::rig_help.get());
-    pathRow(M::rig.get(), transform_, FileDialog::Mode::File, {".txt", ".csv"});
+    ui::TextWrapped(M::rig_help);
+    pathRow(M::rig, transform_, FileDialog::Mode::File, {".txt", ".csv"});
     if (!transform_.empty()) {
-        ImGui::InputText(M::first.get(), &first_);
-        ImGui::InputText(M::second.get(), &second_);
+        ui::InputText(M::first, &first_);
+        ui::InputText(M::second, &second_);
         valid = valid && !first_.empty() && !second_.empty() && first_ != second_;
     }
-    ImGui::TextWrapped("%s", M::intrinsics_help.get());
-    ImGui::TextUnformatted(app::survey::kIntrinsicsExample);
-    if (ImGui::SmallButton(M::intrinsics_copy.get())) ImGui::SetClipboardText(app::survey::kIntrinsicsExample);
-    pathRow(M::intrinsics.get(), intrinsics_, FileDialog::Mode::File, {".txt"});
+    ui::TextWrapped(M::intrinsics_help);
+    ui::TextRaw(app::survey::kIntrinsicsExample);
+    if (ui::SmallButton(M::intrinsics_copy)) ImGui::SetClipboardText(app::survey::kIntrinsicsExample);
+    pathRow(M::intrinsics, intrinsics_, FileDialog::Mode::File, {".txt"});
     ImGui::BeginDisabled(images_.empty());
-    pathRow(M::flat.get(), flat_, FileDialog::Mode::Folder, {}, true);
+    pathRow(M::flat, flat_, FileDialog::Mode::Folder, {}, true);
     ImGui::EndDisabled();
     if (!flat_.empty()) {
-        ImGui::Checkbox(M::replace.get(), &replace_);
-        if (replace_) ImGui::SliderFloat(M::overlap.get(), &overlap_, 50, 100, "%.0f%%");
+        ui::Checkbox(M::replace, &replace_);
+        if (replace_) ui::SliderFloat(M::overlap, &overlap_, 50, 100, "%.0f%%");
     }
     ImGui::BeginDisabled(!valid || picker_.is_open());
-    const std::string run = std::string(M::run.get()) + "###pose_survey_run";
-    if (ImGui::Button(run.c_str())) start();
+    if (ui::Button(M::run)) start();
     ImGui::EndDisabled();
     ImGui::EndDisabled();
-    if (runner_.busy() && ImGui::Button(M::cancel.get())) runner_.cancel();
-    if (!status_.empty()) ImGui::TextWrapped("%s", status_.c_str());
+    if (runner_.busy() && ui::Button(M::cancel)) runner_.cancel();
+    if (!status_.empty()) ui::TextWrappedRaw(status_);
     if (!log_.empty()) {
         ImGui::BeginChild("##survey-log", ImVec2(0, 175), ImGuiChildFlags_Borders);
         const bool bottom = ImGui::GetScrollY() >= ImGui::GetScrollMaxY();
-        for (const auto& line : log_) ImGui::TextUnformatted(line.c_str());
+        for (const auto& line : log_) ui::TextRaw(line);
         if (bottom) ImGui::SetScrollHereY(1.0f);
         ImGui::EndChild();
     }
