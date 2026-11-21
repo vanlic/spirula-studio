@@ -213,6 +213,19 @@ void engine_backward_from_render_grad(
 
 void engine_optim_step(int step, const OptimConfig& cfg);
 
+struct LidarTrainingView {
+    static constexpr int size = 256;
+    static constexpr float focal = 73.900834f;
+    struct Sample { float u, v, z; };
+    std::array<std::array<float, 4>, 4> viewmat;
+    std::vector<Sample> samples;
+    size_t frame_points = 0;
+};
+
+float engine_train_lidar_view(const LidarTrainingView& view, float weight,
+                              int step, const std::string& primitive, bool packed,
+                              const EngineStepConfig& cfg);
+
 // --- Bilagrid (RGB / depth / normal) ---
 // Allocates and identity-initializes a bilagrid per camera. Must be called
 // after set_camera_params. RGB applies to the rendered prediction; depth and

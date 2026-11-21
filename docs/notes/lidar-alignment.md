@@ -31,6 +31,38 @@ Pass `--lidar-positions camera-centres.txt` to keep the input calibration and
 add camera centre priors with a 5 cm standard deviation. The file has one
 `image_name X Y Z` record per camera in the same metre frame.
 
+## Timed LiDAR supervision
+
+Timed depth supervision supports an already aligned COLMAP model, with or
+without photo depth maps from `spirula lidar`.
+
+```bash
+spirula train --data . --colmap-recon-dir sparse/lidar \
+    --lidar-scan scan.las --lidar-poses lidar-origins.csv
+```
+
+The trainer needs a LAS or LAZ point format with GPS time and a CSV with
+`time_sec,x,y,z` for the **laser origins**, with the same clock as the scan. If the trajectory
+is a camera trajectory, apply the camera-to-laser calibration before writing
+the CSV. The trainer groups points by 100 ms windows, interpolates origins
+and keeps every fourth input point for depth supervision. A window and
+direction are sampled once per training step. New runs also draw a 3% sample
+of the scan for seeding.
+
+The training loss uses metric axial depth, the LOG residual and its measured
+depth weighting. The optional geometry update runs before the photo update.
+It samples the native rasterizer at the fractional projected coordinates by
+bilinear interpolation and uses its backward pass and optimizer. This
+interpolation and the timed windows are approximations to scan-specific rays.
+During the LiDAR update, projected splats also receive an additive parameter
+bias after Adam. It brings the two longer log-scales closer and shrinks the
+shortest, reversing the short-axis nudge when the log-scale span exceeds 8.
+It leaves spherical scales alone and applies a small downward opacity-logit
+bias. The nudges use the step's learning rates independently of the residual
+and Adam moments.
+Inside this mode the trainer keeps the model in metric space and uses the
+non-fused, float32 optimizer. `--lidar-weight 0` leaves normal training active.
+
 ## Reconstruct from known poses
 
 On the New Dataset screen, open **Reconstruct from known poses**. Choose the

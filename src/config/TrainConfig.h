@@ -49,14 +49,13 @@ inline int train_tier_rank(const char* tier) {
     return kTrainNumTiers - 1;
 }
 
-// A path field's `choices` is "<folder>" or "<file>", a file optionally with
-// the extension it takes ("<file>.ply"), behind "<data>/" when a relative path
-// starts at the dataset folder. The GUI gives these a picker.
+// Path choices are "<folder>" or "<file>" with optional pipe-separated
+// extensions. A "<data>/" prefix makes paths relative to the dataset.
 struct TrainPathSpec {
     bool is_path = false;
     bool folder = false;
     bool in_data = false;
-    const char* extension = "";
+    const char* extensions = "";
 };
 
 inline TrainPathSpec train_path_spec(const char* choices) {
@@ -69,7 +68,7 @@ inline TrainPathSpec train_path_spec(const char* choices) {
         s.is_path = s.folder = true;
     } else if (!std::strncmp(choices, "<file>", 6)) {
         s.is_path = true;
-        s.extension = choices + 6;
+        s.extensions = choices + 6;
     }
     return s;
 }
@@ -278,6 +277,9 @@ inline bool train_choice_valid(const std::string& value, const char* choices) {
     X(int, alpha_reg_warmup, 12000, "geometry", "advanced", "")              \
     X(int, reg_warmup_length, 0, "geometry", "advanced", "")                 \
     X(float, depth_supervision_weight, 0.0f, "geometry", "basic", "")        \
+    X(std::string, lidar_scan, "", "geometry", "advanced", "<file>.las|.laz") \
+    X(std::string, lidar_poses, "", "geometry", "advanced", "<file>.csv")    \
+    X(float, lidar_weight, 0.25f, "geometry", "advanced", "")                 \
     X(float, normal_supervision_weight, 0.01f, "geometry", "basic", "")      \
     X(std::optional<bool>, input_depth_is_ray_depth, std::nullopt, "geometry", "basic", "") \
     X(int, supervision_warmup, 0, "geometry", "expert", "")                  \

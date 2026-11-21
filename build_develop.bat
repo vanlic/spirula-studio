@@ -17,6 +17,7 @@ rem ---------------------------------------------------------------------------
 set "BACKENDSEL=cuda"
 echo %* | findstr /i /c:"BACKEND=vulkan" >nul && set "BACKENDSEL=vulkan"
 set "BUILDDIR=build_%BACKENDSEL%"
+if defined SS_DEV_BUILD_DIR set "BUILDDIR=%SS_DEV_BUILD_DIR%"
 
 rem ---------------------------------------------------------------------------
 rem Codegen (optional -- the generated files are committed)
@@ -128,6 +129,7 @@ for /f %%m in ('powershell -NoProfile -Command "[int]((Get-CimInstance Win32_Ope
 set /a JOBS=AVAILABLE_MB/JOB_RAM_MB
 if %JOBS% gtr %NUMBER_OF_PROCESSORS% set JOBS=%NUMBER_OF_PROCESSORS%
 if %JOBS% lss 1 set JOBS=1
+if defined SS_DEV_BUILD_JOBS set "JOBS=%SS_DEV_BUILD_JOBS%"
 echo Build dir     : %BUILDDIR%
 echo Available RAM : %AVAILABLE_MB% MB
 echo CPU cores     : %NUMBER_OF_PROCESSORS%
@@ -136,7 +138,9 @@ echo.
 
 rem `if errorlevel 1` is a >= test on a SIGNED value, so it reads a negative
 rem exit code as success -- a failed link returning -1 printed "Build complete".
-cmake --build "%BUILDDIR%" -j %JOBS%
+set "TARGETARG="
+if defined SS_DEV_BUILD_TARGET set "TARGETARG=--target %SS_DEV_BUILD_TARGET%"
+cmake --build "%BUILDDIR%" -j %JOBS% %TARGETARG%
 if %ERRORLEVEL% neq 0 exit /b 1
 
 echo.

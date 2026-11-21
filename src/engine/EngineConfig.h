@@ -104,6 +104,7 @@ struct LossConfig {
 // LR values arrive already multiplied by train_frame_scale / alpha where
 // that applies; the engine consumes them verbatim.
 struct OptimConfig {
+    bool lidar_update = false;
     float lr_means        = 0.0f;
     float lr_projective_depth = 0.0f;
     bool projective_photometric = true;

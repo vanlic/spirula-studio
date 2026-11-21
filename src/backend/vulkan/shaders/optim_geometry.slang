@@ -11,6 +11,7 @@
 // reaches (`inside` masks work, never control flow around a reduce).
 #include "shaders/projective_depth.slang"
 #define CudaDeviceExport ForceInline
+#include "shaders/lidar_shape.slang"
 #include "shaders/per_splat_losses.slang"
 #include "shaders/pixel_wise.slang"
 #include "shaders/projection_utils.slang"
@@ -120,7 +121,7 @@ struct OptimGeoParams {
     uint32_t skip_unrendered_reg;
     uint32_t has_auxiliary_opacities;
     uint32_t surfel;  // per_splat_losses_bwd's
-    uint32_t _pad0;
+    uint32_t lidar_shape_bias;
 };
 
 // Data gradient for a PRIMS-wide attribute: decode from the 16-bit
@@ -190,6 +191,7 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
                                        p.quats[4 * gid + 2],
                                        p.quats[4 * gid + 3]));
         float opac = p.opacities[gid];
+        const bool bias_shape = p.lidar_shape_bias != 0 && p.radii[gid] > 0.0f;
 
         // regularizer gradients
         float v_losses[5] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
@@ -267,6 +269,7 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
             float3 new_scale = scale - lr_scales * g1v /
                                            (oq_sqrt3(g2v * ibc2) +
                                             float3(kAdamEps));
+            if (bias_shape) new_scale -= p.lr_scales * lidar_scale_bias(scale);
             // 2DGS: z stays at or below the disc, so a collapsed disc reads as dead.
             if (p.surfel != 0) new_scale.z = min(new_scale.z, max(new_scale.x, new_scale.y));
             p.scales[3 * gid] = new_scale.x;
@@ -337,6 +340,7 @@ void fused_optim_3dgs_geometry(uint3 wg: SV_GroupID,
             float new_opac = opac - lr_opacs * g1[0] /
                                         (sqrt(max(g2[0] * ibc2, 0.0f)) +
                                          kAdamEps);
+            if (bias_shape) new_opac -= p.lr_opacs * lidar_opacity_bias();
             p.opacities[gid] = new_opac;
             if (kNonShQuant != 0) {
                 nq_g1_opac[0] = g1[0];

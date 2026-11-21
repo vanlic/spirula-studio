@@ -806,8 +806,9 @@ void engine_optim_step(int step, const OptimConfig& cfg) {
         visit,
         grad_q, projective_depth_state(cfg),
         step + 1, per_splat_steps,
-        grad_scale, zero_grad, engine().pca_reg.v_opacities
+        grad_scale, zero_grad, engine().pca_reg.v_opacities, cfg.lidar_update
     );
+    if (cfg.lidar_update) return;
 
     // DC color update path. When non-SH quant is on the geometry kernel
     // already updated features_dc through the codec; skip the separate

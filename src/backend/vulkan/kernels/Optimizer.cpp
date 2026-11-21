@@ -448,7 +448,7 @@ struct OptimGeoParams {
     uint32_t has_steps, has_densify_score, numel, wgs_per_row, has_visit,
         skip_unrendered_reg;
     uint32_t has_auxiliary_opacities;
-    uint32_t surfel, _pad0;
+    uint32_t surfel, lidar_shape_bias;
 };
 static_assert(sizeof(OptimGeoParams) == 48 * 8 + 34 * 4,
               "params layout must match the slang struct");
@@ -615,7 +615,8 @@ void fused_optim_3dgs_geometry(
     SplatVisitState visit,
     GradQuantBuffers gq, ProjectiveDepthOptim depth,
     int32_t step, DeviceVector<int32_t> per_splat_steps,
-    float grad_scale, bool zero_grad, DeviceVector<float> auxiliary_opacities
+    float grad_scale, bool zero_grad, DeviceVector<float> auxiliary_opacities,
+    bool lidar_shape_bias
 ) {
     if (num_splats == 0) return;
 
@@ -623,6 +624,7 @@ void fused_optim_3dgs_geometry(
     p.auxiliary_opacities = vkk::or_fallback(auxiliary_opacities.data_ptr());
     p.has_auxiliary_opacities = auxiliary_opacities.data_ptr() ? 1u : 0u;
     p.surfel = surfel ? 1u : 0u;
+    p.lidar_shape_bias = lidar_shape_bias && radii.data_ptr() ? 1u : 0u;
     p.means = (uint64_t)means.data_ptr();
     p.v_means = vkk::or_fallback(v_means.data_ptr());
     p.g1_means = vkk::or_fallback(g1_means.data_ptr());

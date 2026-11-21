@@ -322,8 +322,7 @@ bool draw_path(const char* key, std::string& v, const TrainPathSpec& spec,
         row.pick.field = key;
         row.pick.title = row.name.get();
         row.pick.folder = spec.folder;
-        row.pick.extensions.clear();
-        if (*spec.extension) row.pick.extensions.push_back(spec.extension);
+        row.pick.extensions = *spec.extensions ? split_choices(spec.extensions) : std::vector<std::string>{};
         row.pick.start_dir = pick_start(v, spec, row.data);
     }
     ImGui::EndGroup();

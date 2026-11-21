@@ -146,7 +146,8 @@ void fused_optim_3dgs_geometry(
     SplatVisitState visit,
     GradQuantBuffers gq, ProjectiveDepthOptim depth,
     int32_t step, DeviceVector<int32_t> per_splat_steps,
-    float grad_scale, bool zero_grad, DeviceVector<float> auxiliary_opacities
+    float grad_scale, bool zero_grad, DeviceVector<float> auxiliary_opacities,
+    bool lidar_shape_bias
 );
 
 

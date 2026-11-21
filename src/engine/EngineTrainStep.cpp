@@ -116,6 +116,93 @@ void _engine_arm_step_forward(const EngineStepConfig& cfg,
     engine().background.match_luma_pending = cfg.background.match_luminance;
 }
 
+float engine_train_lidar_view(const LidarTrainingView& view, float weight,
+                              int step, const std::string& primitive, bool packed,
+                              const EngineStepConfig& cfg) {
+    constexpr int size = LidarTrainingView::size;
+    constexpr float focal = LidarTrainingView::focal;
+    constexpr float half = size * 0.5f;
+    const float intr[] = {focal, focal, half, half};
+    set_camera_params(size, size, "PINHOLE", "NONE",
+                      {(uint64_t)view.viewmat.data(), 4, {1, 4, 4}},
+                      {(uint64_t)intr, 4, {1, 4}}, {0, 4, {1, 0}});
+    auto& e = engine();
+    e.optim.use_fused_proj_bwd_optim = false;
+    e.fwd.tile_active = DeviceVector<int32_t>();
+    e.fwd.accum_weight = DeviceVector<float>();
+    e.fwd.accum_mode = DensifyAccumMode::None;
+    e.fwd.score_pending = false;
+    e.fwd.kernel_cut = 0.0f;
+    _set_cur_cam_indices({0, 0, {}});
+    _engine_arm_step_forward(cfg, primitive, {}, false);
+    e.fwd.skip_depth_pending = false;
+    {
+        struct RestoreBackground {
+            bool& flag;
+            bool saved;
+            ~RestoreBackground() { flag = saved; }
+        } background{e.background.enabled, e.background.enabled};
+        e.background.enabled = false;
+        forward_3dgs(primitive, 0, packed, false, 0);
+    }
+    const auto& depth = std::get<1>(e.fwd.renders);
+    if (!depth.data_ptr()) return 0.0f;
+
+    std::vector<float> ray(size * size), T(size * size), axial(size * size);
+    std::vector<float> grad_depth(size * size), grad_T(size * size), grad_rgb(3 * size * size);
+    backend::memcpy_sync(ray.data(), depth.data_ptr(), ray.size() * sizeof(float),
+                         backend::MemcpyKind::DeviceToHost);
+    backend::memcpy_sync(T.data(), e.fwd.render_Ts.data_ptr(), T.size() * sizeof(float),
+                         backend::MemcpyKind::DeviceToHost);
+    for (int i = 0; i < size * size; ++i) {
+        const float x = (i % size + 0.5f - half) / focal;
+        const float y = (i / size + 0.5f - half) / focal;
+        axial[i] = 1.0f / std::sqrt(1 + x * x + y * y);
+    }
+
+    const float frame_weight = weight / float(view.frame_points);
+    double loss = 0;
+    for (const auto& p : view.samples) {
+        const float x = std::clamp(p.u - 0.5f, 0.0f, float(size - 1));
+        const float y = std::clamp(p.v - 0.5f, 0.0f, float(size - 1));
+        const int x0 = int(x), y0 = int(y);
+        const int x1 = std::min(x0 + 1, size - 1), y1 = std::min(y0 + 1, size - 1);
+        const float dx = x - x0, dy = y - y0;
+        const int pixel[] = {y0 * size + x0, y0 * size + x1, y1 * size + x0, y1 * size + x1};
+        const float mix[] = {(1 - dx) * (1 - dy), dx * (1 - dy), (1 - dx) * dy, dx * dy};
+        float prediction = 0;
+        for (int j = 0; j < 4; ++j) {
+            const int i = pixel[j];
+            const float alpha = T[i] < 0.01f ? 1.0f : 1.0f - T[i];
+            prediction += mix[j] * alpha * axial[i] * ray[i];
+        }
+        const float err = prediction - p.z;
+        const float w = frame_weight / (1.0f - 0.4f * p.z + 0.1f * p.z * p.z);
+        loss += 0.1f * w * std::log1p(10.0f * std::abs(err));
+        const float g = w * float((err > 0) - (err < 0)) / (1 + 10 * std::abs(err));
+        for (int j = 0; j < 4; ++j) {
+            const int i = pixel[j];
+            const float derivative = g * mix[j] * axial[i];
+            const bool cumulative = T[i] >= 0.01f;
+            grad_depth[i] += derivative * (cumulative ? 1.0f - T[i] : 1.0f);
+            if (cumulative) grad_T[i] -= derivative * ray[i];
+        }
+    }
+    engine_backward_from_render_grad({(uint64_t)grad_rgb.data(), 4, {1, size, size, 3}},
+                                     {(uint64_t)grad_depth.data(), 4, {1, size, size, 1}},
+                                     {(uint64_t)grad_T.data(), 4, {1, size, size, 1}});
+    OptimConfig optim;
+    optim.lidar_update = true;
+    optim.sh_value_bits = cfg.optim.sh_value_bits;
+    optim.use_per_splat_bias_correction = true;
+    optim.lr_means = cfg.optim.lr_means;
+    optim.lr_quats = cfg.optim.lr_quats;
+    optim.lr_scales = cfg.optim.lr_scales;
+    optim.lr_opacities = cfg.optim.lr_opacities;
+    engine_optim_step(step, optim);
+    return float(loss);
+}
+
 void _engine_step_image_stages(TorchTensorView cam_indices) {
     // PPISP already ran inside the forward in the before-color-space order,
     // and in the fused chain's after-encode one.

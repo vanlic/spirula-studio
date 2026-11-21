@@ -5,6 +5,11 @@
 #include "kernels/optim/OptimizerCommon.cuh"
 #include "kernels/optim/ScreenSizeHinge.cuh"
 
+namespace SlangLidarShape {
+#include "generated/set_namespace.cuh"
+#include "generated/lidar_shape.cuh"
+}
+
 // ================
 // Fused geometry optimizer
 // ================
@@ -141,7 +146,7 @@ __global__ void fused_optim_3dgs_geometry_kernel(
     const GradQuantBuffers gq, ProjectiveDepthOptim depth,
     const int32_t scalar_step,
     const int32_t* __restrict__ steps,
-    const int64_t numel
+    const int64_t numel, bool lidar_shape_bias
 ) {
     static constexpr float eps = 1e-15f;
     static constexpr float beta1 = 0.9f;
@@ -167,6 +172,7 @@ __global__ void fused_optim_3dgs_geometry_kernel(
         float step = (float)(steps != nullptr ? steps[idx] : scalar_step);
         float inv_bias_correction1 = 1.0f / (1.0f - powf(beta1, step));
         float inv_bias_correction2 = 1.0f / (1.0f - powf(beta2, step));
+        const float scale_bias_lr = lr_scales, opacity_bias_lr = lr_opacs;
         lr_means *= inv_bias_correction1;
         lr_quats *= inv_bias_correction1;
         lr_scales *= inv_bias_correction1;
@@ -177,6 +183,7 @@ __global__ void fused_optim_3dgs_geometry_kernel(
         float3 scale = scales[idx];
         float4 quat = normalize(quats[idx]);
         float opac = opacities[idx];
+        const bool bias_shape = lidar_shape_bias && radii != nullptr && radii[idx] > 0.0f;
 
         // load gradient, with regularization
         static constexpr int kNumPerSplatLosses = 5;
@@ -239,6 +246,8 @@ __global__ void fused_optim_3dgs_geometry_kernel(
         g1_scale = beta1 * g1_scale + (1.f - beta1) * v_scale;
         g2_scale = beta2 * g2_scale + (1.f - beta2) * v_scale*v_scale;
         float3 updated_scale = scale - lr_scales * g1_scale / (sqrtf(g2_scale * inv_bias_correction2) + eps);
+        if (bias_shape)
+            updated_scale -= scale_bias_lr * SlangLidarShape::lidar_scale_bias(scale);
         // 2DGS: z stays at or below the disc, so a collapsed disc reads as dead.
         if (surfel) updated_scale.z = fminf(updated_scale.z, fmaxf(updated_scale.x, updated_scale.y));
         scales[idx] = updated_scale;
@@ -285,6 +294,8 @@ __global__ void fused_optim_3dgs_geometry_kernel(
         g1_opac = beta1 * g1_opac + (1.f - beta1) * v_opac;
         g2_opac = beta2 * g2_opac + (1.f - beta2) * v_opac*v_opac;
         float updated_opac = opac - lr_opacs * g1_opac / (sqrtf(g2_opac * inv_bias_correction2) + eps);
+        if (bias_shape)
+            updated_opac -= opacity_bias_lr * SlangLidarShape::lidar_opacity_bias();
         opacities[idx] = updated_opac;
         if constexpr (non_sh_quant) {
             nq_g1_opac = g1_opac;
@@ -477,7 +488,8 @@ void fused_optim_3dgs_geometry(
     SplatVisitState visit,
     GradQuantBuffers gq, ProjectiveDepthOptim depth,
     int32_t step, DeviceVector<int32_t> per_splat_steps,
-    float grad_scale, bool zero_grad, DeviceVector<float> auxiliary_opacities
+    float grad_scale, bool zero_grad, DeviceVector<float> auxiliary_opacities,
+    bool lidar_shape_bias
 ) {
     if (num_splats == 0)
         return;
@@ -501,7 +513,7 @@ void fused_optim_3dgs_geometry(
         const NonShQuantState,
         const SplatVisitState,
         const GradQuantBuffers, ProjectiveDepthOptim,
-        const int32_t, const int32_t*, const int64_t);
+        const int32_t, const int32_t*, const int64_t, bool);
     KFn kfn = nullptr;
     const bool nq = non_sh.enabled;
     const bool ct = nq && color_trust.enabled;
@@ -542,7 +554,7 @@ void fused_optim_3dgs_geometry(
         non_sh,
         visit,
         gq, depth,
-        step, per_splat_steps.data_ptr(), num_splats
+        step, per_splat_steps.data_ptr(), num_splats, lidar_shape_bias
     );
     CHECK_DEVICE_ERROR(cudaGetLastError());
 }

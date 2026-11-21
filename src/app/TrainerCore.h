@@ -5,6 +5,7 @@
 // setup_engine() resets it before starting another run.
 
 #include "app/SystemRecorder.h"
+#include "app/LidarTraining.h"
 #include "app/TrainPerfLog.h"
 #include "app/TrainForecast.h"
 #include "engine/Engine.h"
@@ -280,6 +281,7 @@ public:
     // --roi-region (by default the dataset's first roi/*.json), or both
     // intersected. Null for all of space.
     std::shared_ptr<const Region> roi;
+    std::unique_ptr<app::lidar::TrainingScan> lidar;
     std::shared_ptr<const RegionCameras> roi_cameras;
     // The whole seed cloud (parsed frame) and which of it the part owns, kept
     // from before the partition cut it down: what the region masks project.

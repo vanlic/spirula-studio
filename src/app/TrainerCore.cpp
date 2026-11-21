@@ -338,8 +338,9 @@ SeedSplats seed_splats(const ColmapPoints3D& pts, const TrainConfig& cfg,
     std::normal_distribution<float> gauss(0.f, 1.f);
     std::uniform_real_distribution<float> uni(0.f, 1.f);
 
-    float scale_init   = cfg.scale_init.value_or(0.5f);
-    float opacity_init = cfg.opacity_init.value_or(0.1f);
+    const bool scan_init = !cfg.lidar_scan.empty() && cfg.lidar_weight > 0.0f;
+    float scale_init   = cfg.scale_init.value_or(scan_init ? 1.0f : 0.5f);
+    float opacity_init = cfg.opacity_init.value_or(scan_init ? 0.25f : 0.1f);
 
     // Resolve seed count into [min_init, cap_max].
     int64_t n_src = pts.num();
@@ -383,26 +384,36 @@ SeedSplats seed_splats(const ColmapPoints3D& pts, const TrainConfig& cfg,
         for (int d = 0; d < 3; d++)
             s.means[i*3 + d] = (float)pts.xyz[pick[i]*3 + d];
 
-    // log(scale_init * sqrt(mean d^2 of 4-NN)) over xyz, over the DISTINCT
-    // points: a repeat is its own zero-distance neighbor, and would seed
-    // every splat at log(1e-8).
-    std::vector<float> nn = knn::mean_knn_dist(s.means, n_distinct, 4);
+    // Repeated seeds would otherwise be their own zero-distance neighbors.
+    std::vector<float> nn = knn::mean_knn_dist(s.means, n_distinct, scan_init ? 3 : 4);
+    float max_scale = std::numeric_limits<float>::infinity();
+    if (scan_init) {
+        auto ordered = nn;
+        auto middle = ordered.begin() + n_distinct / 2;
+        std::nth_element(ordered.begin(), middle, ordered.end());
+        max_scale = std::max(1e-4f, 10 * *middle);
+    }
     for (int64_t i = 0; i < num; i++) {
         float d = nn[i % n_distinct];
         // Scatter the repeats through the neighborhood they copy.
         if (i >= n_distinct)
             for (int k = 0; k < 3; k++)
                 s.means[i*3 + k] += 0.25f * d * gauss(rng);
-        float v = std::log(scale_init * d + 1e-8f);
+        float v = scan_init ? std::log(scale_init * std::max(1e-4f, std::min(d, max_scale)))
+                            : std::log(scale_init * d + 1e-8f);
         s.scales[i*3+0] = s.scales[i*3+1] = s.scales[i*3+2] = v;
     }
-    if (cfg.suppress_initial_scales && post && post->n_post > 0)
+    if (!scan_init && cfg.suppress_initial_scales && post && post->n_post > 0)
         suppress_initial_scales(s, n_distinct, *post);
 
     for (int64_t i = 0; i < num; i++) {
-        float q[4] = {gauss(rng), gauss(rng), gauss(rng), gauss(rng)};
-        float qn = std::sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
-        for (int d = 0; d < 4; d++) s.quats[i*4 + d] = q[d] / std::max(qn, 1e-12f);
+        if (scan_init) {
+            s.quats[i*4] = 1.0f;
+        } else {
+            float q[4] = {gauss(rng), gauss(rng), gauss(rng), gauss(rng)};
+            float qn = std::sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+            for (int d = 0; d < 4; d++) s.quats[i*4 + d] = q[d] / std::max(qn, 1e-12f);
+        }
         s.opacities[i] = std::log(opacity_init / (1.f - opacity_init));
     }
 
@@ -415,7 +426,7 @@ SeedSplats seed_splats(const ColmapPoints3D& pts, const TrainConfig& cfg,
     for (int64_t i = 0; i < num; i++) {
         float col[3];
         for (int d = 0; d < 3; d++)
-            col[d] = all_same ? uni(rng) : pts.rgb[pick[i]*3 + d] / 255.f;
+            col[d] = all_same && !scan_init ? uni(rng) : pts.rgb[pick[i]*3 + d] / 255.f;
         to_splat(col);
         for (int d = 0; d < 3; d++)
             s.features_dc[i*3 + d] = (col[d] - 0.5f) / 0.28209479177387814f;
@@ -1092,6 +1103,20 @@ void TrainerSession::setup_region() {
 }
 
 void TrainerSession::check_config() {
+    if (!cfg.lidar_scan.empty() || !cfg.lidar_poses.empty()) {
+        if (cfg.lidar_scan.empty() || cfg.lidar_poses.empty() ||
+            !std::isfinite(cfg.lidar_weight) || cfg.lidar_weight < 0.0f)
+            throw std::runtime_error("LiDAR training requires both scan and trajectory and a nonnegative weight");
+        if (cfg.lidar_weight > 0.0f) {
+            cfg.auto_scale_poses = false;
+            cfg.orientation_method = "none";
+            cfg.center_method = "none";
+            cfg.relative_scale = 1.0f;
+            cfg.use_fused_proj_bwd_optim = false;
+            cfg.use_per_splat_bias_correction = true;
+            cfg.quantization_level = 0;
+        }
+    }
     if (std::string what = train_config_error(cfg); !what.empty())
         throw std::runtime_error(what);
     if (!cfg.init_ply.empty() && !cfg.resume.empty())
@@ -1254,6 +1279,24 @@ void TrainerSession::load_dataset() {
         ds.normalized_rotation = {1,0,0, 0,1,0, 0,0,1};
     }
 
+    lidar.reset();
+    if (!cfg.lidar_scan.empty() && cfg.lidar_weight > 0.0f) {
+        const auto resolve = [&](const std::string& name) {
+            const auto path = fs::u8path(name);
+            return (path.is_absolute() ? path : fs::u8path(cfg.data) / path).u8string();
+        };
+        std::vector<double> scan_seeds;
+        const bool seed_from_scan = cfg.resume.empty() && cfg.init_ply.empty() &&
+                                    cfg.random_init != "always";
+        lidar = std::make_unique<app::lidar::TrainingScan>(
+            resolve(cfg.lidar_scan), resolve(cfg.lidar_poses), seed_from_scan ? &scan_seeds : nullptr);
+        for (size_t i = 0; i < scan_seeds.size(); ++i) scan_seeds[i] -= ds.center[i % 3];
+        ds.points.xyz.insert(ds.points.xyz.end(), scan_seeds.begin(), scan_seeds.end());
+        ds.points.rgb.insert(ds.points.rgb.end(), scan_seeds.size(), uint8_t(128));
+        log("[lidar] " + std::to_string(lidar->frame_count()) + " scan windows, " +
+            std::to_string(lidar->point_count()) + " timed returns, " +
+            std::to_string(scan_seeds.size() / 3) + " scan seeds");
+    }
     seed_at_random();
 
     // POST-split camera bake (identity when no warp flag applies).
@@ -1873,9 +1916,17 @@ void TrainerSession::save_checkpoint(int step, bool full) {
 std::map<std::string, float> TrainerSession::train_step(int step) {
     int sh_degree_to_use = step / std::max(cfg.sh_degree_warmup_every, 1);
     EngineStepConfig sc = build_step_config(cfg, st, step);
+    std::optional<float> lidar_loss;
+    LidarTrainingView view;
+    if (lidar && lidar->sample(step, ds.center, view))
+        lidar_loss = engine_train_lidar_view(view, cfg.lidar_weight, step, cfg.primitive, cfg.packed, sc);
     auto losses = engine_train_step_managed(
         step, cfg.num_iterations, cfg.primitive, sh_degree_to_use,
         cfg.packed, sc);
+    if (lidar_loss) {
+        losses["lidar_depth_loss"] = *lidar_loss;
+        losses["lidar_samples"] = float(view.samples.size());
+    }
     if (cfg.progressive_resolution) {
         // Streamed steps can cross an epoch boundary out of order; the schedule
         // only gets finer, so a switch is the first divisor below every one before.
@@ -1898,7 +1949,7 @@ std::map<std::string, float> TrainerSession::train_step(int step) {
     // well under 10, so 1e3 is clear of anything legitimate.
     if (!_diverged_loss_reported) {
         for (const auto& [name, value] : losses) {
-            if (name == "cur_num_splats" || name == "max_num_splats" ||
+            if (name == "cur_num_splats" || name == "max_num_splats" || name == "lidar_samples" ||
                 name == "num_added" || name == "num_dead" ||
                 name == "num_relocated")
                 continue;
