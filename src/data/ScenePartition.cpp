@@ -932,7 +932,10 @@ ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
         throw std::runtime_error("partition: this method requires a camera graph");
     ScenePartition p;
     p.options = opt;
-    if (opt.method != PartitionMethod::Lcc) p.options.lcc_min_track_length = 0;
+    if (opt.method != PartitionMethod::Lcc) {
+        p.options.lcc_min_track_length = 0;
+        p.options.lcc_robust_bounds = false;
+    }
     p.source = cov.source;
     p.frame_names = FrameIndex(ds.image_filenames).unique_tails();
     if (opt.method == PartitionMethod::Lcc) {
@@ -1609,6 +1612,7 @@ void write_partition(const ScenePartition& p, const std::string& json_path,
         w.field_raw("lcc_voxel_size", json_number_exact(p.options.lcc_voxel_size));
         w.field_raw("lcc_overlap", json_number_exact(p.options.lcc_overlap));
         w.field("lcc_min_track_length", p.options.lcc_min_track_length);
+        w.field("lcc_robust_bounds", p.options.lcc_robust_bounds);
     }
     w.end();
     w.field("num_parts", p.num_parts);
@@ -1676,6 +1680,8 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
         p.options.lcc_gpixels = o->get_double("lcc_gpixels", p.options.lcc_gpixels);
         p.options.lcc_voxel_size = o->get_double("lcc_voxel_size", p.options.lcc_voxel_size);
         p.options.lcc_overlap = o->get_double("lcc_overlap", p.options.lcc_overlap);
+        if (const JsonValue* robust = o->find("lcc_robust_bounds"))
+            p.options.lcc_robust_bounds = robust->as_bool();
         if (const JsonValue* threshold = o->find("lcc_min_track_length")) {
             const double value = threshold->as_double(-1);
             if (value < 0 || value > std::numeric_limits<int>::max() || std::floor(value) != value)
@@ -1781,9 +1787,8 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
 bool apply_partition(ParsedDataset& ds, const ScenePartition& p, int part,
                      PartitionApplied& out) {
     if (part < 0 || part >= p.num_parts) return false;
-    if (!p.spatial_parts.empty() && p.options.lcc_min_track_length > 0 &&
-        (size_t)ds.points.num() != p.point_label.size())
-        throw std::runtime_error("partition: track-filtered LCC requires the original sparse seed cloud");
+    if (p.filters_seed_points() && (size_t)ds.points.num() != p.point_label.size())
+        throw std::runtime_error("partition: filtered LCC requires the original seed cloud");
     out = PartitionApplied{};
     out.frames_before = ds.num_cameras;
     out.points_before = ds.points.num();

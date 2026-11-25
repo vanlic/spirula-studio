@@ -247,7 +247,7 @@ void PartitionPanel::poll() {
             _part_meshes = std::move(_new_meshes);
             _part_opt = _compute_opt;
             _part_seed_count = _ds.points.num();
-            if (_part.options.lcc_min_track_length > 0)
+            if (_part.filters_seed_points())
                 _part_seed_count = std::count_if(_part.point_label.begin(), _part.point_label.end(),
                                                 [](int32_t label) { return label >= 0; });
             _part_valid = true;
@@ -276,6 +276,7 @@ bool PartitionPanel::options_changed() const {
            a.max_projected_points != b.max_projected_points ||
            a.lcc_gpixels != b.lcc_gpixels || a.lcc_voxel_size != b.lcc_voxel_size ||
            a.lcc_overlap != b.lcc_overlap || a.lcc_min_track_length != b.lcc_min_track_length ||
+           a.lcc_robust_bounds != b.lcc_robust_bounds ||
            a.projection_depth_slack != b.projection_depth_slack ||
            a.proximity_neighbours != b.proximity_neighbours ||
            a.source != b.source;
@@ -326,7 +327,7 @@ void PartitionPanel::refresh_view() {
             show.points.rgb.clear();
             show.points.xyz.reserve((size_t)n_pts * 3);
             show.points.rgb.reserve((size_t)n_pts * 3);
-            const bool filtered = _part.options.lcc_min_track_length > 0;
+            const bool filtered = _part.filters_seed_points();
             for (int64_t i = 0; i < n_pts; i++) {
                 const int label = _part.point_label[(size_t)i];
                 if (filtered && label < 0) continue;
@@ -454,6 +455,8 @@ void PartitionPanel::draw_controls() {
         if (ui::InputDouble(pmsg::lbl_lcc_overlap, &_opt.lcc_overlap, "%g"))
             _opt.lcc_overlap = std::max(0.0, _opt.lcc_overlap);
         ui::help_on_hover(pmsg::opt_lcc_overlap);
+        ui::Checkbox(pmsg::lbl_lcc_robust_bounds, &_opt.lcc_robust_bounds);
+        ui::help_on_hover(pmsg::opt_lcc_robust_bounds);
         ImGui::BeginDisabled(!_loaded || !spirula::tracks_usable(_ds, _tracks));
         ImGui::SetNextItemWidth(px(120.0f));
         if (ui::InputInt(pmsg::lbl_lcc_min_track_length, &_opt.lcc_min_track_length))

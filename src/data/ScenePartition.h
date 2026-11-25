@@ -53,6 +53,7 @@ struct PartitionOptions {
     double lcc_voxel_size = 0.0;
     double lcc_overlap = 0.0;
     int lcc_min_track_length = 0;
+    bool lcc_robust_bounds = false;
 };
 
 // Projection rows are shared by nearby file-order points to bound observer storage.
@@ -118,6 +119,9 @@ struct ScenePartition {
     std::vector<SpatialPart> spatial_parts;
 
     bool empty() const { return num_parts == 0; }
+    bool filters_seed_points() const {
+        return !spatial_parts.empty() && (options.lcc_min_track_length > 0 || options.lcc_robust_bounds);
+    }
     // Core plus ring, sorted.
     std::vector<int32_t> frames_of(int part) const;
     int64_t core_count(int part) const;

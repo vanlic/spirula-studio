@@ -226,6 +226,29 @@ SS_MSG(lbl_lcc_overlap,
     RU("Макс. перекрытие"),
     TR("Azami örtüşme"));
 
+SS_MSG(lbl_lcc_robust_bounds,
+    EN("Robust bounds"), JA("外れ値に強い境界"),
+    ZH_HANS("稳健边界"), ZH_HANT("穩健邊界"),
+    KO("강건한 경계"), DE("Robuste Grenzen"),
+    FR("Bornes robustes"), ES("Límites robustos"),
+    PT("Limites robustos"), IT("Limiti robusti"),
+    NL("Robuuste grenzen"), RU("Устойчивые границы"), TR("Aykırı değerlere dayanıklı sınırlar"));
+
+SS_MSG(opt_lcc_robust_bounds,
+    EN("Exclude points outside padded percentile bounds before partitioning."),
+    JA("分割前に、余白付きパーセンタイル範囲の外にある点を除外します。"),
+    ZH_HANS("分区前排除带余量的百分位边界之外的点。"),
+    ZH_HANT("分區前排除帶餘量的百分位邊界之外的點。"),
+    KO("분할 전에 여유를 둔 백분위수 범위 밖의 점을 제외합니다."),
+    DE("Punkte außerhalb erweiterter Perzentilgrenzen vor dem Teilen ausschließen."),
+    FR("Exclut les points hors des bornes par centiles élargies avant la partition."),
+    ES("Excluye los puntos fuera de los límites percentiles ampliados antes de dividir."),
+    PT("Exclui pontos fora dos limites de percentis ampliados antes da divisão."),
+    IT("Esclude i punti fuori dai limiti percentili ampliati prima della divisione."),
+    NL("Sluit vóór het verdelen punten buiten de verruimde percentielgrenzen uit."),
+    RU("Исключает точки вне расширенных процентильных границ перед разбиением."),
+    TR("Bölmeden önce genişletilmiş yüzdelik sınırları dışındaki noktaları eler."));
+
 SS_MSG(lbl_lcc_min_track_length,
     EN("Min. track length"), JA("最小トラック長"),
     ZH_HANS("最少 Track 观测数"), ZH_HANT("最少 Track 觀測數"),

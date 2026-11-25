@@ -1021,7 +1021,7 @@ void TrainerSession::apply_partition_config(ParsedDataset& d, const ScenePartiti
                 roi_cloud_inside[i] = p.point_label[i] == cfg.partition_part;
         } else {
             const Aabb box = p.spatial_parts[(size_t)cfg.partition_part].expanded();
-            const bool filtered = p.options.lcc_min_track_length > 0;
+            const bool filtered = p.filters_seed_points();
             if (!filtered) roi_cloud = d.points.xyz;
             roi_cloud_inside.reserve(p.point_label.size());
             for (size_t i = 0; i < p.point_label.size(); i++) {
@@ -1270,9 +1270,9 @@ void TrainerSession::load_dataset() {
     }
     std::optional<ScenePartition> partition;
     if (!cfg.partition.empty()) partition = read_partition(cfg.partition);
-    if (partition && partition->options.lcc_min_track_length > 0) {
+    if (partition && partition->filters_seed_points()) {
         if (!cfg.seed_pointcloud.empty() && cfg.seed_pointcloud != spirula::dense::kSparseSeed)
-            throw std::runtime_error("Track-filtered LCC requires sparse seed points");
+            throw std::runtime_error("Filtered LCC requires the original dataset seed points");
         cfg.seed_pointcloud = spirula::dense::kSparseSeed;
     }
     // Written back into cfg, so config.json names the cloud this run used.

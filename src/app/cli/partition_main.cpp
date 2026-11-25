@@ -57,6 +57,7 @@ void usage() {
     help_row("--gpixels <n>", P::opt_gpixels);
     help_row("--voxel-size <size>", P::opt_lcc_voxel);
     help_row("--overlap <size>", P::opt_lcc_overlap);
+    help_row("--robust-bounds", P::opt_lcc_robust_bounds);
     help_row("--min-track-length <n>", P::opt_lcc_min_track_length);
     help_row("--ring <fraction>", P::opt_ring);
     help_row("--ring-min-points <n>", P::opt_ring_min);
@@ -104,6 +105,10 @@ int run_split(int argc, char** argv) {
             if (a == "--gpixels") opt.lcc_gpixels = v;
             else if (a == "--voxel-size") opt.lcc_voxel_size = v;
             else opt.lcc_overlap = v;
+            lcc_flag = a;
+        }
+        else if (a == "--robust-bounds") {
+            opt.lcc_robust_bounds = true;
             lcc_flag = a;
         }
         else if (a == "--min-track-length") {
@@ -177,7 +182,7 @@ int run_split(int argc, char** argv) {
     char cut[32];
     std::snprintf(cut, sizeof cut, "%.1f", 100.0 * part.cut_fraction);
     if (lcc) {
-        const auto seeds = opt.lcc_min_track_length > 0
+        const auto seeds = part.filters_seed_points()
             ? std::count_if(part.point_label.begin(), part.point_label.end(),
                             [](int32_t label) { return label >= 0; })
             : ds.points.num();

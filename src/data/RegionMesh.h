@@ -35,5 +35,6 @@ std::vector<RegionMesh> label_boundary_meshes(const LabelField& f, const Aabb& b
 // 1st..99th percentile of the points per axis, padded by a tenth: a box one
 // stray point far away cannot blow up.
 Aabb robust_bounds(const float* xyz, int64_t n);
+Aabb robust_bounds(const double* xyz, int64_t n, const int64_t* point_indices = nullptr);
 
 }  // namespace spirula

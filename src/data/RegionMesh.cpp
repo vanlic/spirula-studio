@@ -186,12 +186,16 @@ std::vector<RegionMesh> label_boundary_meshes(const LabelField& f, const Aabb& b
     return out;
 }
 
-Aabb robust_bounds(const float* xyz, int64_t n) {
+template <typename T>
+static Aabb robust_bounds_impl(const T* xyz, int64_t n, const int64_t* point_indices) {
     Aabb box;
     if (n <= 0) return box;
-    std::vector<float> v((size_t)n);
+    std::vector<T> v((size_t)n);
     for (int a = 0; a < 3; a++) {
-        for (int64_t i = 0; i < n; i++) v[(size_t)i] = xyz[i * 3 + a];
+        for (int64_t i = 0; i < n; i++) {
+            const int64_t row = point_indices ? point_indices[i] : i;
+            v[(size_t)i] = xyz[(size_t)row * 3 + a];
+        }
         const size_t lo = (size_t)(0.01 * (double)(n - 1)), hi = (size_t)(0.99 * (double)(n - 1));
         std::nth_element(v.begin(), v.begin() + lo, v.end());
         const double l = v[lo];
@@ -202,6 +206,14 @@ Aabb robust_bounds(const float* xyz, int64_t n) {
         box.hi[a] = u + pad;
     }
     return box;
+}
+
+Aabb robust_bounds(const float* xyz, int64_t n) {
+    return robust_bounds_impl(xyz, n, nullptr);
+}
+
+Aabb robust_bounds(const double* xyz, int64_t n, const int64_t* point_indices) {
+    return robust_bounds_impl(xyz, n, point_indices);
 }
 
 }  // namespace spirula

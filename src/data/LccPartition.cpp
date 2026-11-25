@@ -1,5 +1,6 @@
 #include "data/LccPartition.h"
 
+#include "data/RegionMesh.h"
 #include "data/SceneProjection.h"
 
 #include <algorithm>
@@ -18,6 +19,7 @@ namespace {
 constexpr int kRasterSize = 128;
 constexpr double kCoverage = 0.03;
 constexpr double kGiPixel = 1073741824.0;
+constexpr int64_t kMinPercentileSeeds = 101;  // One sample per 1% tail with the rank based on n - 1.
 
 struct Voxel {
     std::array<double, 3> center;
@@ -381,6 +383,30 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
         if (!std::all_of(q, q + 3, [](double v) { return std::isfinite(v); }))
             throw std::runtime_error("partition: LCC requires finite point coordinates");
         bounds.expand(q);
+    }
+    if (opt.lcc_robust_bounds && seeds.count >= kMinPercentileSeeds) {
+        check_cancel(cancel);
+        const Aabb clip = robust_bounds(ds.points.xyz.data(), seeds.count,
+                                       seeds.kept.empty() ? nullptr : seeds.kept.data());
+        SeedRows clipped{0, {}};
+        clipped.kept.reserve((size_t)seeds.count);
+        bounds = {};
+        for (int64_t i = 0; i < seeds.count; ++i) {
+            if (i % 4096 == 0) check_cancel(cancel);
+            const int64_t row = seeds[i];
+            const double* q = &ds.points.xyz[(size_t)row * 3];
+            if (!clip.contains(q)) continue;
+            clipped.kept.push_back(row);
+            bounds.expand(q);
+        }
+        clipped.count = (int64_t)clipped.kept.size();
+        if (log) log("LCC: kept " + std::to_string(clipped.count) + " of " +
+                     std::to_string(seeds.count) + " seed points within robust bounds");
+        if (clipped.count == 0)
+            throw std::runtime_error("partition: LCC robust bounds removed all seed points");
+        seeds = std::move(clipped);
+    } else if (opt.lcc_robust_bounds && log) {
+        log("LCC: robust bounds kept all points in a cloud with fewer than 101 seeds");
     }
     const double extent = std::max({bounds.hi[0] - bounds.lo[0], bounds.hi[1] - bounds.lo[1],
                                     bounds.hi[2] - bounds.lo[2]});

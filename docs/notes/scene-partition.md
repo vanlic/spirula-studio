@@ -48,6 +48,12 @@ at least that many COLMAP image observations. It applies before computing
 bounds, projecting voxels and choosing the training seeds. Use 0 to keep
 all points. Each image contributes its own observation.
 
+`--robust-bounds` (Robust bounds in the panel) clips points outside the
+per-axis 1st to 99th percentile box, padded on both sides by 10% of each span.
+It runs after track filtering and uses the surviving points for bounds,
+automatic voxel size, visibility and training seeds. With fewer than 101
+points it leaves the cloud intact, so the 1% tails have symmetric support.
+
 Training uses an expanded box for its seeds and ROI. Images with more than
 3% coarse pixel coverage in the expanded box are shared across blocks as
 needed. A block with lower coverage uses its best visible image. Merging

@@ -332,6 +332,46 @@ void check_lcc_track_filter() {
           "LCC reports when no points meet the track threshold");
 }
 
+void check_lcc_robust_bounds() {
+    using namespace spirula;
+    ParsedDataset ds = make_corridor(3, 0, 1).ds;
+    for (int y = -8; y <= 8; ++y)
+        for (int x = 0; x < 12; ++x)
+            ds.points.xyz.insert(ds.points.xyz.end(), {x * 0.125, y * 0.125, 0.0});
+    const int64_t clean_count = ds.points.num();
+    PartitionOptions opt;
+    opt.method = PartitionMethod::Lcc;
+    const Covisibility cov = build_covisibility(ds, nullptr, opt);
+    const ScenePartition clean = partition_scene(ds, cov, opt);
+    ds.points.xyz.insert(ds.points.xyz.end(), {0.5, 0.0, -200.0, 400.0, 0.0, 0.0});
+    ds.points.rgb.assign(ds.points.xyz.size(), 128);
+    opt.lcc_robust_bounds = true;
+    const ScenePartition clipped = partition_scene(ds, cov, opt);
+    const auto& a = clean.spatial_parts.at(0);
+    const auto& b = clipped.spatial_parts.at(0);
+    check(b.core.lo[2] == a.core.lo[2] && b.core.hi[0] == a.core.hi[0] &&
+              b.gpixels == a.gpixels &&
+              clipped.point_label[(size_t)clean_count] == -1 && clipped.point_label.back() == -1 &&
+              clipped.part_points.at(0).size() == (size_t)clean_count,
+          "LCC robust bounds exclude distant points from the box, pixel load and training seeds");
+
+    const fs::path file = fs::temp_directory_path() / "spirula_lcc_robust_test.json";
+    write_partition(clipped, file.string(), "corridor");
+    const ScenePartition loaded = read_partition(file.string());
+    PartitionApplied summary;
+    check(loaded.options.lcc_robust_bounds && apply_partition(ds, loaded, 0, summary) &&
+              summary.points_after == clean_count,
+          "LCC robust bounds and the filtered seed indices survive saving");
+    fs::remove(file);
+    fs::remove(fs::path(file).replace_extension(".bin"));
+
+    ds.points.xyz = {0.0, 0.0, 0.0, 0.25, 0.0, 0.0};
+    ds.points.rgb.resize(ds.points.xyz.size());
+    const ScenePartition tiny = partition_scene(ds, cov, opt);
+    check(tiny.part_points.at(0).size() == 2,
+          "LCC robust bounds do not clip a percentile from a tiny cloud");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -340,6 +380,7 @@ int main(int argc, char** argv) {
         check_lcc_partition();
         check_lcc_tight_budget();
         check_lcc_track_filter();
+        check_lcc_robust_bounds();
         return g_failures != 0;
     }
     if (argc == 4 && std::string(argv[1]) == "--camera-metadata") {
@@ -405,6 +446,7 @@ int main(int argc, char** argv) {
     check_lcc_partition();
     check_lcc_tight_budget();
     check_lcc_track_filter();
+    check_lcc_robust_bounds();
     const Corridor corr = make_corridor(60, 40, 5);
     const ParsedDataset& ds = corr.ds;
 
