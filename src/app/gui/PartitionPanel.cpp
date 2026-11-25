@@ -155,7 +155,10 @@ void PartitionPanel::run_compute() {
         std::lock_guard<std::mutex> lk(_mu);
         opt = _compute_opt;
     }
-    const bool reuse = _cov_valid && _cov_opt.source == opt.source &&
+    const bool lcc = opt.method == spirula::PartitionMethod::Lcc;
+    if (lcc) opt.parts = 0;
+    const bool reuse = !lcc && _cov_valid && _cov_opt.method != spirula::PartitionMethod::Lcc &&
+                       _cov_opt.source == opt.source &&
                        (opt.method == spirula::PartitionMethod::Voronoi || _cov.camera_graph_built) &&
                        _cov_opt.max_projected_points == opt.max_projected_points &&
                        _cov_opt.projection_depth_slack == opt.projection_depth_slack &&
@@ -170,7 +173,12 @@ void PartitionPanel::run_compute() {
     spirula::ScenePartition part = spirula::partition_scene(_ds, _cov, opt, log, &_cancel);
     if (_cancel.load()) throw spirula::PartitionCancelled();
     std::vector<spirula::RegionMesh> meshes;
-    if (part.field && !part.field->empty()) {
+    if (lcc) {
+        for (const spirula::SpatialPart& spatial : part.spatial_parts) {
+            if (_cancel.load()) throw spirula::PartitionCancelled();
+            meshes.push_back(spirula::box_boundary_mesh(spatial.core));
+        }
+    } else if (part.field && !part.field->empty()) {
         std::vector<float> xyz;
         const int64_t n = _ds.points.num(), stride = std::max<int64_t>(1, n / 200000);
         for (int64_t i = 0; i < n; i += stride)
@@ -261,6 +269,8 @@ bool PartitionPanel::options_changed() const {
            a.method != b.method || a.outside_seed_fraction != b.outside_seed_fraction ||
            a.max_seeds != b.max_seeds ||
            a.max_projected_points != b.max_projected_points ||
+           a.lcc_gpixels != b.lcc_gpixels || a.lcc_voxel_size != b.lcc_voxel_size ||
+           a.lcc_overlap != b.lcc_overlap ||
            a.projection_depth_slack != b.projection_depth_slack ||
            a.proximity_neighbours != b.proximity_neighbours ||
            a.source != b.source;
@@ -402,6 +412,9 @@ void PartitionPanel::draw_controls() {
         ui::TextColoredWrappedRaw(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), _status);
     } else if (_notice) {
         ui::TextDisabledWrapped(*_notice);
+    } else if (_part_valid && !_part.spatial_parts.empty()) {
+        ui::TextWrapped(pmsg::status_lcc, {_part.num_parts, (long long)_ds.num_cameras,
+                                         (long long)_ds.points.num()});
     } else if (_part_valid) {
         char cut[32];
         std::snprintf(cut, sizeof cut, "%.1f", 100.0 * _part.cut_fraction);
@@ -416,52 +429,65 @@ void PartitionPanel::draw_controls() {
     {
         int m = (int)_opt.method;
         ImGui::SetNextItemWidth(px(-80.0f));
-        if (ui::Combo(pmsg::lbl_method, &m, {&pmsg::meth_graph, &pmsg::meth_viewgraph, &pmsg::meth_voronoi}))
+        if (ui::Combo(pmsg::lbl_method, &m, {&pmsg::meth_graph, &pmsg::meth_viewgraph,
+                                             &pmsg::meth_voronoi, &pmsg::meth_lcc}))
             _opt.method = (spirula::PartitionMethod)m;
         ui::help_on_hover(pmsg::opt_method);
     }
-    ImGui::SetNextItemWidth(px(-80.0f));
-    if (ui::Combo(pmsg::lbl_source, &_source_idx,
-                  {&pmsg::src_auto, &pmsg::src_tracks, &pmsg::src_projection, &pmsg::src_proximity}))
-        _opt.source = kSources[std::clamp(_source_idx, 0, 3)];
-    ui::help_on_hover(pmsg::lbl_source_help);
-    if (_loaded) {
-        const bool tracked = spirula::tracks_usable(_ds, _tracks);
-        ui::TextDisabled(pmsg::log_dataset,
-                         {(long long)_ds.num_cameras, (long long)_ds.points.num(),
-                          tracked ? pmsg::word_yes.get() : pmsg::word_no.get()});
-        if (!tracked) ui::TextColoredWrapped(ImVec4(1.0f, 0.75f, 0.30f, 1.0f), pmsg::warn_no_tracks);
-    }
-
-    ui::Text(pmsg::lbl_split_by);
-    if (ui::RadioButton(pmsg::mode_parts, _mode == 0)) _mode = 0;
-    ImGui::SameLine();
-    if (ui::RadioButton(pmsg::mode_max, _mode == 1)) _mode = 1;
-    ui::help_on_hover(pmsg::mode_help);
-    ImGui::SetNextItemWidth(px(120.0f));
-    if (_mode == 0) {
-        int parts = std::max(2, _opt.parts);
-        if (ui::InputIntRaw("##parts", &parts)) _opt.parts = std::max(2, parts);
-        if (_opt.parts < 2) _opt.parts = 2;
-    } else {
-        _opt.parts = 0;
-        int mx = _opt.max_images;
-        if (ui::InputIntRaw("##maximages", &mx)) _opt.max_images = std::max(10, mx);
-    }
-
-    // ImGui::SetNextItemWidth(px(160.0f));
-    // ui::SliderFloat(pmsg::lbl_ring, &_opt.ring_fraction, 0.0f, 0.5f, "%.2f");
-    // ui::help_on_hover(pmsg::lbl_ring_help);
-    {
-        static const int kSeeds[] = {250000, 500000, 1000000, 2000000, 4000000};
-        static const char* kSeedNames[] = {"250k", "500k", "1M", "2M", "4M"};
-        int idx = 2;
-        for (int i = 0; i < 5; i++)
-            if (kSeeds[i] == _opt.max_seeds) idx = i;
+    if (_opt.method == spirula::PartitionMethod::Lcc) {
         ImGui::SetNextItemWidth(px(120.0f));
-        if (ui::ComboRaw(ui::detail::label(pmsg::lbl_seeds), &idx, kSeedNames, 5))
-            _opt.max_seeds = kSeeds[idx];
-        ui::help_on_hover(pmsg::lbl_seeds_help);
+        if (ui::InputDouble(pmsg::lbl_gpixels, &_opt.lcc_gpixels, "%g"))
+            _opt.lcc_gpixels = std::max(1e-6, _opt.lcc_gpixels);
+        ui::help_on_hover(pmsg::opt_gpixels);
+        ImGui::SetNextItemWidth(px(120.0f));
+        if (ui::InputDouble(pmsg::lbl_lcc_voxel, &_opt.lcc_voxel_size, "%g"))
+            _opt.lcc_voxel_size = std::max(0.0, _opt.lcc_voxel_size);
+        ui::help_on_hover(pmsg::opt_lcc_voxel);
+        ImGui::SetNextItemWidth(px(120.0f));
+        if (ui::InputDouble(pmsg::lbl_lcc_overlap, &_opt.lcc_overlap, "%g"))
+            _opt.lcc_overlap = std::max(0.0, _opt.lcc_overlap);
+        ui::help_on_hover(pmsg::opt_lcc_overlap);
+    } else {
+        ImGui::SetNextItemWidth(px(-80.0f));
+        if (ui::Combo(pmsg::lbl_source, &_source_idx,
+                      {&pmsg::src_auto, &pmsg::src_tracks, &pmsg::src_projection, &pmsg::src_proximity}))
+            _opt.source = kSources[std::clamp(_source_idx, 0, 3)];
+        ui::help_on_hover(pmsg::lbl_source_help);
+        if (_loaded) {
+            const bool tracked = spirula::tracks_usable(_ds, _tracks);
+            ui::TextDisabled(pmsg::log_dataset,
+                             {(long long)_ds.num_cameras, (long long)_ds.points.num(),
+                              tracked ? pmsg::word_yes.get() : pmsg::word_no.get()});
+            if (!tracked) ui::TextColoredWrapped(ImVec4(1.0f, 0.75f, 0.30f, 1.0f), pmsg::warn_no_tracks);
+        }
+
+        ui::Text(pmsg::lbl_split_by);
+        if (ui::RadioButton(pmsg::mode_parts, _mode == 0)) _mode = 0;
+        ImGui::SameLine();
+        if (ui::RadioButton(pmsg::mode_max, _mode == 1)) _mode = 1;
+        ui::help_on_hover(pmsg::mode_help);
+        ImGui::SetNextItemWidth(px(120.0f));
+        if (_mode == 0) {
+            int parts = std::max(2, _opt.parts);
+            if (ui::InputIntRaw("##parts", &parts)) _opt.parts = std::max(2, parts);
+            if (_opt.parts < 2) _opt.parts = 2;
+        } else {
+            _opt.parts = 0;
+            int mx = _opt.max_images;
+            if (ui::InputIntRaw("##maximages", &mx)) _opt.max_images = std::max(10, mx);
+        }
+
+        {
+            static const int kSeeds[] = {250000, 500000, 1000000, 2000000, 4000000};
+            static const char* kSeedNames[] = {"250k", "500k", "1M", "2M", "4M"};
+            int idx = 2;
+            for (int i = 0; i < 5; i++)
+                if (kSeeds[i] == _opt.max_seeds) idx = i;
+            ImGui::SetNextItemWidth(px(120.0f));
+            if (ui::ComboRaw(ui::detail::label(pmsg::lbl_seeds), &idx, kSeedNames, 5))
+                _opt.max_seeds = kSeeds[idx];
+            ui::help_on_hover(pmsg::lbl_seeds_help);
+        }
     }
 
     const bool stale = options_changed();
@@ -530,7 +556,8 @@ void PartitionPanel::draw_parts_table() {
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerH |
                                   ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY;
     const float rows = (float)std::min(_part.num_parts + 1, 9);
-    if (!ImGui::BeginTable("##parts", 4, flags,
+    const bool lcc = !_part.spatial_parts.empty();
+    if (!ImGui::BeginTable("##parts", lcc ? 5 : 4, flags,
                            ImVec2(0, ImGui::GetFrameHeightWithSpacing() * (rows + 0.5f))))
         return;
     ImGui::TableSetupScrollFreeze(0, 1);
@@ -538,6 +565,7 @@ void PartitionPanel::draw_parts_table() {
     ui::TableSetupColumn(pmsg::col_core, ImGuiTableColumnFlags_WidthStretch, 1.0f);
     ui::TableSetupColumn(pmsg::col_ring, ImGuiTableColumnFlags_WidthStretch, 1.0f);
     ui::TableSetupColumn(pmsg::col_points, ImGuiTableColumnFlags_WidthStretch, 1.3f);
+    if (lcc) ui::TableSetupColumn(pmsg::col_gpixels, ImGuiTableColumnFlags_WidthStretch, 1.2f);
     ImGui::TableHeadersRow();
 
     ImGui::TableNextRow();
@@ -575,6 +603,12 @@ void PartitionPanel::draw_parts_table() {
         ui::TextRaw(std::to_string(_part.ring[(size_t)k].size()));
         ImGui::TableNextColumn();
         ui::TextRaw(std::to_string(_part.part_points[(size_t)k].size()));
+        if (lcc) {
+            ImGui::TableNextColumn();
+            char load[32];
+            std::snprintf(load, sizeof load, "%.5g", _part.spatial_parts[(size_t)k].gpixels);
+            ui::TextRaw(load);
+        }
     }
     ImGui::EndTable();
 }

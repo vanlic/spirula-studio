@@ -1,12 +1,7 @@
 #pragma once
 
-// Splitting a reconstruction into parts that train separately and merge back:
-// who sees what (the model's tracks, the seed cloud projected into the frames,
-// or camera proximity when there is nothing else), a normalized cut of the
-// joint camera-point graph into parts under the image cap, the region of space
-// each part owns (a LabelField over its points), and the ring of outside
-// cameras each part borrows so a seam is trained from both sides.
-// docs/notes/scene-partition.md has the design and the file format.
+// Scene partitioning for separate training and ownership-based merging.
+// See docs/notes/scene-partition.md.
 
 #include "core/GraphCut.h"
 #include "data/DatasetParser.h"
@@ -28,7 +23,7 @@ bool covisibility_source_from_name(const std::string& s, CovisibilitySource& out
 
 // Graph cuts the joint camera-point visibility graph; ViewGraph cuts the
 // cameras by covisibility. Voronoi uses convex camera-centroid cells.
-enum class PartitionMethod { Graph = 0, ViewGraph, Voronoi };
+enum class PartitionMethod { Graph = 0, ViewGraph, Voronoi, Lcc };
 const char* partition_method_name(PartitionMethod m);
 bool partition_method_from_name(const std::string& s, PartitionMethod& out);
 
@@ -54,6 +49,9 @@ struct PartitionOptions {
     float projection_depth_slack = 0.0f;
     // Proximity covisibility: neighbours per camera.
     int proximity_neighbours = 8;
+    double lcc_gpixels = 16.0;
+    double lcc_voxel_size = 0.0;
+    double lcc_overlap = 0.0;
 };
 
 // Projection rows are shared by nearby file-order points to bound observer storage.
@@ -88,6 +86,15 @@ Covisibility build_covisibility(const ParsedDataset& ds, const SparseStats* trac
 // own, one row per seed point.
 bool tracks_usable(const ParsedDataset& ds, const SparseStats& tracks);
 
+struct SpatialPart {
+    Aabb core;
+    double overlap = 0;
+    double gpixels = 0;
+
+    Aabb expanded() const;
+    bool owns(const double xyz[3]) const;
+};
+
 struct ScenePartition {
     int num_parts = 0;
     CovisibilitySource source = CovisibilitySource::Proximity;
@@ -107,11 +114,13 @@ struct ScenePartition {
     // positions [N,3], which orient a splat's normal at the merge.
     std::shared_ptr<LabelField> field;
     std::vector<float> frame_centers;
+    std::vector<SpatialPart> spatial_parts;
 
     bool empty() const { return num_parts == 0; }
     // Core plus ring, sorted.
     std::vector<int32_t> frames_of(int part) const;
     int64_t core_count(int part) const;
+    std::shared_ptr<const Region> training_region(int part) const;
     // Connected pieces of the covisibility graph each part's core makes: 1 is
     // a part in one place, more is one the cut could not keep together.
     std::vector<int32_t> core_pieces;

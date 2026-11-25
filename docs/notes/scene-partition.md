@@ -16,6 +16,39 @@ The default is `--method viewgraph`. `--method graph` cuts the joint
 camera/point visibility graph; `--method voronoi` makes convex cells around
 camera clusters. The same choice is available in the Partition panel.
 
+### Visible-pixel partition (`--method lcc`)
+
+```sh
+spirula partition split /path/to/dataset --method lcc --gpixels 16 -o partition.json
+```
+
+This method requires calibrated cameras and a seed cloud. It projects the
+occupied voxels of up to `--max-projected-points` sampled seeds into a coarse
+per-image depth buffer. The estimated load is 1.15 times the visible pixel
+area, scaled to each source image's resolution and divided by 2^30. This
+CPU estimate uses Spirula's camera models and point-cloud rasterization.
+
+The largest block is split first. Each axis is ranked by its weighted
+5th-to-95th percentile span. The splitter tests up to 150, 100 and 50
+quantiles on those axes, scoring both expanded children against the parent
+and the budget. It stops when every block fits `--gpixels`, or fails if an
+over-budget block cannot be split. `--voxel-size` sets the voxel width in
+dataset units (0 uses 1/256 of the longest scene extent). `--overlap` sets
+the maximum padding per side in the same units (0 uses adaptive padding).
+Padding starts from the greater of three voxels and 5% of the dominant
+weighted span, then is capped by the parent padding and the user limit.
+The method uses its pixel budget and projection in place of the part count,
+camera cap, covisibility source and camera ring controls.
+
+Training uses an expanded box for its seeds and ROI. Images with more than
+3% coarse pixel coverage in the expanded box are shared across blocks as
+needed. A block with lower coverage uses its best visible image. Merging
+keeps splat centres only in each block's half-open core box, so a centre
+on a shared split belongs to the upper child. Boxes and per-block loads
+are saved in partition JSON alongside the usual image and seed tables.
+
+### Voronoi partition
+
 Voronoi uses deterministic farthest-point initialization followed by Lloyd
 iterations over camera positions. Fitting excludes at most 2% of isolated
 poses whose eighth-neighbor distance exceeds 16 times the median; every
@@ -330,10 +363,13 @@ matches the full model.
   frame), `parts[k].ring` (frame indices), `cut_fraction`, `binary`.
 - BIN: `SSPT` v2, then the `LabelField` (`SSLF` v1 for directional fields, v2 for Euclidean fields: seeds [n,4] and BVH
   nodes [m,8] as floats), the camera centres [N,3], then u8 owner per seed
-  point in file order, then per part a u32 count and u32 point indices.
+  point in file order, then per part a u64 count and u32 point indices.
+- LCC writes `SSPT` v3 with the same point tables, zero camera centres
+  and no label field. JSON stores each `core_box` (three lower then
+  three upper coordinates), `overlap` and `gpixels`.
 
-The trainer needs the JSON's frame lists, the BIN's point tables and the
-field (its region of interest); the merge needs the field and the centres. A run's `config.json` carries `partition` and
+The trainer uses the frame lists, point tables and the part's ROI. The
+merge queries the label field or the core box. A run's `config.json` carries `partition` and
 `partition_part`, which is how `find_partition_runs` pairs runs with parts
 without any naming convention.
 

@@ -7,6 +7,8 @@
 #include "data/Json.h"
 #include "data/JsonWrite.h"
 #include "data/Knn.h"
+#include "data/LccPartition.h"
+#include "data/SceneProjection.h"
 #include "data/VoronoiPartition.h"
 #include "external/stb_image.h"
 #include "external/stb_image_write.h"
@@ -126,60 +128,6 @@ void keep_rows(std::vector<T>& v, int64_t n, int stride, const uint8_t* keep) {
 }
 
 // Camera-to-world of frame i as CV world-to-camera: ray = R_cv (p - t).
-struct FrameView {
-    double R[9];   // rows: the CV camera axes in world
-    double t[3];
-    camhost::Camera cam;
-    double cos_max = -2.0;   // cone pre-test for pinhole; -2 disables
-};
-
-FrameView frame_view(const ParsedDataset& ds, int64_t i) {
-    FrameView f;
-    const float* M = &ds.c2w[(size_t)i * 12];
-    // OpenGL columns X, Y, Z (camera looks down -Z); CV is (x, -y, -z).
-    for (int k = 0; k < 3; k++) {
-        f.R[0 + k] = M[k * 4 + 0];
-        f.R[3 + k] = -M[k * 4 + 1];
-        f.R[6 + k] = -M[k * 4 + 2];
-        f.t[k] = M[k * 4 + 3];
-    }
-    f.cam.model = ds.camera_models.empty() ? 0 : ds.camera_models[(size_t)i];
-    f.cam.tier = ds.camera_distortions.empty() ? 0 : ds.camera_distortions[(size_t)i];
-    f.cam.width = ds.widths[(size_t)i];
-    f.cam.height = ds.heights[(size_t)i];
-    f.cam.fx = ds.intrins[(size_t)i * 4 + 0];
-    f.cam.fy = ds.intrins[(size_t)i * 4 + 1];
-    f.cam.cx = ds.intrins[(size_t)i * 4 + 2];
-    f.cam.cy = ds.intrins[(size_t)i * 4 + 3];
-    if (!ds.dist_coeffs.empty())
-        for (int k = 0; k < 8; k++) f.cam.dist[k] = ds.dist_coeffs[(size_t)i * 8 + k];
-    if (f.cam.model == 0 && f.cam.fx > 0 && f.cam.fy > 0) {
-        // The widest normalized coordinate any corner reaches, with slack for
-        // lens distortion pulling the border in or out.
-        double r2 = 0;
-        for (int c = 0; c < 4; c++) {
-            const double u = ((c & 1 ? f.cam.width : 0) - f.cam.cx) / f.cam.fx;
-            const double v = ((c & 2 ? f.cam.height : 0) - f.cam.cy) / f.cam.fy;
-            r2 = std::max(r2, u * u + v * v);
-        }
-        const double r = std::sqrt(r2) * 1.15;
-        f.cos_max = 1.0 / std::sqrt(1.0 + r * r);
-    }
-    return f;
-}
-
-bool frame_sees(const FrameView& f, const double p[3], double* pixel = nullptr, double* depth = nullptr) {
-    const double d[3] = {p[0] - f.t[0], p[1] - f.t[1], p[2] - f.t[2]};
-    double ray[3];
-    for (int r = 0; r < 3; r++)
-        ray[r] = f.R[r * 3] * d[0] + f.R[r * 3 + 1] * d[1] + f.R[r * 3 + 2] * d[2];
-    const double len = std::sqrt(ray[0] * ray[0] + ray[1] * ray[1] + ray[2] * ray[2]);
-    if (!(len > 1e-12)) return false;
-    if (f.cos_max > -1.5 && ray[2] / len < f.cos_max) return false;
-    double px[2];
-    if (depth) *depth = len;
-    return camhost::ray_in_frame(f.cam, ray, pixel ? pixel : px);
-}
 
 template <class Visit>
 void visit_camera_tracks(const std::vector<int64_t>& beg, const std::vector<int32_t>& frame,
@@ -721,12 +669,14 @@ const char* partition_method_name(PartitionMethod m) {
         case PartitionMethod::Graph: return "graph";
         case PartitionMethod::ViewGraph: return "viewgraph";
         case PartitionMethod::Voronoi: return "voronoi";
+        case PartitionMethod::Lcc: return "lcc";
     }
     return "viewgraph";
 }
 
 bool partition_method_from_name(const std::string& s, PartitionMethod& out) {
-    for (PartitionMethod m : {PartitionMethod::Graph, PartitionMethod::ViewGraph, PartitionMethod::Voronoi})
+    for (PartitionMethod m : {PartitionMethod::Graph, PartitionMethod::ViewGraph,
+                             PartitionMethod::Voronoi, PartitionMethod::Lcc})
         if (s == partition_method_name(m)) { out = m; return true; }
     return false;
 }
@@ -901,6 +851,11 @@ Covisibility build_covisibility(const ParsedDataset& ds, const SparseStats* trac
                                 const PartitionOptions& opt, const PartitionLog& log,
                                 const std::atomic<bool>* cancel) {
     Covisibility out;
+    if (opt.method == PartitionMethod::Lcc) {
+        out.source = CovisibilitySource::Projection;
+        out.camera_graph_built = false;
+        return out;
+    }
     if (!std::isfinite(opt.projection_depth_slack) || opt.projection_depth_slack < 0)
         throw std::runtime_error("partition: projection depth slack must be finite and nonnegative");
     if (ds.num_cameras == 0) return out;
@@ -941,17 +896,48 @@ int64_t ScenePartition::core_count(int part) const {
     return n;
 }
 
+Aabb SpatialPart::expanded() const {
+    Aabb box = core;
+    for (int axis = 0; axis < 3; ++axis) {
+        box.lo[axis] -= overlap;
+        box.hi[axis] += overlap;
+    }
+    return box;
+}
+
+bool SpatialPart::owns(const double xyz[3]) const {
+    for (int axis = 0; axis < 3; ++axis)
+        if (!(xyz[axis] >= core.lo[axis] && xyz[axis] < core.hi[axis])) return false;
+    return true;
+}
+
+std::shared_ptr<const Region> ScenePartition::training_region(int part) const {
+    if (part < 0 || part >= num_parts) return {};
+    if (spatial_parts.empty()) return field ? std::make_shared<LabelRegion>(field, part) : nullptr;
+    const Aabb box = spatial_parts[(size_t)part].expanded();
+    auto region = std::make_shared<BoxRegion>();
+    for (int axis = 0; axis < 3; ++axis) {
+        region->center[axis] = box.lo[axis] * 0.5 + box.hi[axis] * 0.5;
+        region->half[axis] = box.hi[axis] * 0.5 - box.lo[axis] * 0.5;
+    }
+    return region;
+}
+
 ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
                                const PartitionOptions& opt, const PartitionLog& log,
                                const std::atomic<bool>* cancel) {
     const int64_t n_cam = ds.num_cameras;
     if (n_cam == 0) throw std::runtime_error("partition: the dataset has no cameras");
-    if (!cov.camera_graph_built && opt.method != PartitionMethod::Voronoi)
+    if (!cov.camera_graph_built && opt.method != PartitionMethod::Voronoi && opt.method != PartitionMethod::Lcc)
         throw std::runtime_error("partition: this method requires a camera graph");
     ScenePartition p;
     p.options = opt;
     p.source = cov.source;
     p.frame_names = FrameIndex(ds.image_filenames).unique_tails();
+    if (opt.method == PartitionMethod::Lcc) {
+        partition_lcc(ds, p, log, cancel);
+        return p;
+    }
 
     const int64_t n_pts = ds.points.num();
     const bool tracked = cov.has_tracks() && cov.num_points() == n_pts;
@@ -1582,12 +1568,14 @@ void write_partition(const ScenePartition& p, const std::string& json_path,
 
     std::string bin;
     bin.append(kBinMagic, 4);
-    put(bin, (uint32_t)2);
-    if (p.field) p.field->write(bin);
-    else LabelField().write(bin);
+    put(bin, (uint32_t)(p.spatial_parts.empty() ? 2 : 3));
+    if (p.spatial_parts.empty()) {
+        if (p.field) p.field->write(bin);
+        else LabelField().write(bin);
+    }
     put(bin, (uint64_t)p.frame_centers.size() / 3);
-    bin.append(reinterpret_cast<const char*>(p.frame_centers.data()),
-               p.frame_centers.size() * sizeof(float));
+    if (!p.frame_centers.empty())
+        bin.append(reinterpret_cast<const char*>(p.frame_centers.data()), p.frame_centers.size() * sizeof(float));
     put(bin, (uint64_t)p.point_label.size());
     for (int32_t l : p.point_label) put(bin, (uint8_t)(l < 0 ? LabelField::kNone : l));
     put(bin, (uint32_t)p.num_parts);
@@ -1615,6 +1603,11 @@ void write_partition(const ScenePartition& p, const std::string& json_path,
     w.field("max_projected_points", p.options.max_projected_points);
     w.field("projection_depth_slack", p.options.projection_depth_slack);
     w.field("proximity_neighbours", p.options.proximity_neighbours);
+    if (!p.spatial_parts.empty()) {
+        w.field_raw("lcc_gpixels", json_number_exact(p.options.lcc_gpixels));
+        w.field_raw("lcc_voxel_size", json_number_exact(p.options.lcc_voxel_size));
+        w.field_raw("lcc_overlap", json_number_exact(p.options.lcc_overlap));
+    }
     w.end();
     w.field("num_parts", p.num_parts);
     w.field("num_frames", (long long)p.frame_names.size());
@@ -1635,6 +1628,15 @@ void write_partition(const ScenePartition& p, const std::string& json_path,
         w.key("ring").array();
         for (int32_t f : p.ring[(size_t)k]) w.value(f);
         w.end();
+        if (!p.spatial_parts.empty()) {
+            const SpatialPart& spatial = p.spatial_parts[(size_t)k];
+            w.key("core_box").array();
+            for (double x : spatial.core.lo) w.raw(json_number_exact(x));
+            for (double x : spatial.core.hi) w.raw(json_number_exact(x));
+            w.end();
+            w.field_raw("overlap", json_number_exact(spatial.overlap));
+            w.field_raw("gpixels", json_number_exact(spatial.gpixels));
+        }
         w.end();
     }
     w.end();
@@ -1669,6 +1671,9 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
             (float)o->get_double("projection_depth_slack", p.options.projection_depth_slack);
         p.options.proximity_neighbours =
             (int)o->get_double("proximity_neighbours", p.options.proximity_neighbours);
+        p.options.lcc_gpixels = o->get_double("lcc_gpixels", p.options.lcc_gpixels);
+        p.options.lcc_voxel_size = o->get_double("lcc_voxel_size", p.options.lcc_voxel_size);
+        p.options.lcc_overlap = o->get_double("lcc_overlap", p.options.lcc_overlap);
     }
     p.num_parts = (int)root.find("num_parts")->as_int(0);
     p.cut_fraction = root.get_double("cut_fraction", 0.0);
@@ -1679,13 +1684,36 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
     if (p.frame_label.size() != p.frame_names.size())
         throw std::runtime_error(json_path + ": frame_names and frame_parts differ in length");
     p.ring.assign((size_t)p.num_parts, {});
+    const bool spatial = p.options.method == PartitionMethod::Lcc;
     if (const JsonValue* a = root.find("parts"); a && a->is_array()) {
         if ((int)a->arr.size() != p.num_parts)
             throw std::runtime_error(json_path + ": parts[] does not match num_parts");
-        for (size_t k = 0; k < a->arr.size(); k++)
+        for (size_t k = 0; k < a->arr.size(); k++) {
             if (const JsonValue* r = a->arr[k].find("ring"); r && r->is_array())
                 for (const JsonValue& v : r->arr) p.ring[k].push_back((int32_t)v.as_int(-1));
+            if (!spatial) continue;
+            const JsonValue& entry = a->arr[k];
+            const JsonValue* b = entry.find("core_box");
+            SpatialPart box;
+            box.overlap = entry.get_double("overlap", -1);
+            box.gpixels = entry.get_double("gpixels", -1);
+            if (!b || !b->is_array() || b->arr.size() != 6 || !std::isfinite(box.overlap) ||
+                box.overlap < 0 || !std::isfinite(box.gpixels) || box.gpixels <= 0)
+                throw std::runtime_error(json_path + ": invalid LCC part");
+            for (int axis = 0; axis < 3; ++axis) {
+                const double bad = std::numeric_limits<double>::quiet_NaN();
+                double& lo = box.core.lo[axis];
+                double& hi = box.core.hi[axis];
+                lo = b->arr[(size_t)axis].as_double(bad);
+                hi = b->arr[(size_t)axis + 3].as_double(bad);
+                if (!(lo < hi) || !std::isfinite(lo - box.overlap) || !std::isfinite(hi + box.overlap))
+                    throw std::runtime_error(json_path + ": invalid LCC core box");
+            }
+            p.spatial_parts.push_back(box);
+        }
     }
+    if (spatial && (p.num_parts <= 0 || p.spatial_parts.size() != (size_t)p.num_parts))
+        throw std::runtime_error(json_path + ": missing LCC parts");
 
     const std::string bin_name = root.find("binary") ? root.find("binary")->as_string()
                                                      : fs::path(json_path).stem().string() + ".bin";
@@ -1695,18 +1723,20 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
         throw std::runtime_error(bin_name + " is not a partition table");
     at = 4;
     uint32_t version = 0;
-    if (!get(bin, at, version) || version != 2)
+    if (!get(bin, at, version) || version != (spatial ? 3u : 2u))
         throw std::runtime_error(bin_name + ": unsupported version; compute the partition again");
-    size_t used = 0;
-    p.field = std::make_shared<LabelField>();
-    if (!LabelField::read(bin.data() + at, bin.size() - at, used, *p.field))
-        throw std::runtime_error(bin_name + ": bad label field");
-    at += used;
+    if (!spatial) {
+        size_t used = 0;
+        p.field = std::make_shared<LabelField>();
+        if (!LabelField::read(bin.data() + at, bin.size() - at, used, *p.field))
+            throw std::runtime_error(bin_name + ": bad label field");
+        at += used;
+    }
     uint64_t n_centers = 0;
     if (!get(bin, at, n_centers) || at + n_centers * 12 > bin.size())
         throw std::runtime_error(bin_name + ": truncated camera centres");
     p.frame_centers.resize((size_t)n_centers * 3);
-    std::memcpy(p.frame_centers.data(), bin.data() + at, (size_t)n_centers * 12);
+    if (n_centers) std::memcpy(p.frame_centers.data(), bin.data() + at, (size_t)n_centers * 12);
     at += n_centers * 12;
     uint64_t n_pts = 0;
     if (!get(bin, at, n_pts) || at + n_pts > bin.size())

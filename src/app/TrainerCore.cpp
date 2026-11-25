@@ -1012,11 +1012,21 @@ void TrainerSession::apply_partition_config(ParsedDataset& d) {
     const ScenePartition p = read_partition(cfg.partition);
     if (cfg.partition_part < 0 || cfg.partition_part >= p.num_parts)
         throw std::runtime_error(lfmt(lmsg::err_partition_part, {p.num_parts}));
+    if (&d == &ds) roi = p.training_region(cfg.partition_part);
     if (&d == &ds && (int64_t)p.point_label.size() == d.points.num()) {
         roi_cloud = d.points.xyz;
         roi_cloud_inside.resize(p.point_label.size());
-        for (size_t i = 0; i < p.point_label.size(); i++)
-            roi_cloud_inside[i] = p.point_label[i] == cfg.partition_part;
+        if (p.spatial_parts.empty()) {
+            for (size_t i = 0; i < p.point_label.size(); i++)
+                roi_cloud_inside[i] = p.point_label[i] == cfg.partition_part;
+        } else {
+            const Aabb box = p.spatial_parts[(size_t)cfg.partition_part].expanded();
+            for (size_t i = 0; i < p.point_label.size(); i++) {
+                const double q[3] = {roi_cloud[i * 3] + d.center[0], roi_cloud[i * 3 + 1] + d.center[1],
+                                     roi_cloud[i * 3 + 2] + d.center[2]};
+                roi_cloud_inside[i] = box.contains(q);
+            }
+        }
     }
     PartitionApplied a;
     apply_partition(d, p, cfg.partition_part, a);
@@ -1024,7 +1034,6 @@ void TrainerSession::apply_partition_config(ParsedDataset& d) {
              {cfg.partition_part, (long long)a.frames_after, (long long)a.core,
               (long long)a.ring, (long long)a.points_after}));
     if (a.missing > 0) log(lfmt(lmsg::partition_missing_frames, {(long long)a.missing}));
-    if (&d == &ds && p.field) roi = std::make_shared<LabelRegion>(p.field, cfg.partition_part);
 }
 
 void TrainerSession::load_region() {

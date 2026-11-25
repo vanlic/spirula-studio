@@ -110,8 +110,9 @@ void visit_partition_splats(const ScenePartition& p, const std::vector<std::stri
         st.region_camera_hash = shape.region_camera_hash;
         const auto frame = part_frame(ply, run_dir, shape.region_camera_hash);
         const Sim3& S = frame.dataset_from_train;
+        const SpatialPart* spatial = p.spatial_parts.empty() ? nullptr : &p.spatial_parts[(size_t)k];
         LabelField fallback_cameras;
-        if (!frame.cameras) {
+        if (!frame.cameras && !spatial) {
             std::vector<float> cameras;
             for (int32_t f : p.frames_of(k))
                 cameras.insert(cameras.end(), p.frame_centers.begin() + (size_t)f * 3,
@@ -133,6 +134,10 @@ void visit_partition_splats(const ScenePartition& p, const std::vector<std::stri
             for (int64_t i = 0; i < c.num; i++) {
                 const float* qf = c.means.data() + (size_t)i * 3;
                 const double q[3] = {qf[0], qf[1], qf[2]};
+                if (spatial) {
+                    keep[(size_t)i] = spatial->owns(q);
+                    continue;
+                }
                 double normal[3];
                 const double* np = nullptr;
                 const float* query_point = frame.cameras ? input.means.data() + (size_t)i * 3 : qf;

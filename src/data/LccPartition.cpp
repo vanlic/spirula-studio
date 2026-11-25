@@ -1,0 +1,360 @@
+#include "data/LccPartition.h"
+
+#include "data/SceneProjection.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
+#include <map>
+#include <queue>
+#include <stdexcept>
+#include <utility>
+
+namespace spirula {
+namespace {
+
+constexpr int kRasterSize = 128;
+constexpr double kCoverage = 0.03;
+constexpr double kGiPixel = 1073741824.0;
+
+struct Voxel {
+    std::array<double, 3> center;
+    double load = 0;
+};
+
+struct ImageCoverage {
+    std::vector<std::pair<int, int>> cells;
+    int raster_area = 0;
+    double cell_load = 0;
+};
+
+void check_cancel(const std::atomic<bool>* cancel) {
+    if (cancel && cancel->load(std::memory_order_relaxed)) throw PartitionCancelled();
+}
+
+std::vector<Voxel> make_voxels(const ParsedDataset& ds, const Aabb& bounds, double size,
+                              int limit, const std::atomic<bool>* cancel) {
+    const int64_t stride = 1 + (ds.points.num() - 1) / limit;
+    std::map<std::array<int64_t, 3>, Voxel> grid;
+    for (int64_t i = 0; i < ds.points.num(); i += stride) {
+        if ((i / stride) % 4096 == 0) check_cancel(cancel);
+        const double* q = &ds.points.xyz[(size_t)i * 3];
+        std::array<int64_t, 3> cell;
+        Voxel voxel;
+        for (int axis = 0; axis < 3; ++axis) {
+            const double coordinate = (q[axis] - bounds.lo[axis]) / size;
+            if (coordinate >= double(int64_t(1) << 62))
+                throw std::runtime_error("partition: voxel size is too small for the scene");
+            cell[axis] = (int64_t)coordinate;
+            voxel.center[axis] = bounds.lo[axis] + (double(cell[axis]) + 0.5) * size;
+        }
+        grid.try_emplace(cell, voxel);
+    }
+    std::vector<Voxel> voxels;
+    voxels.reserve(grid.size());
+    for (const auto& entry : grid) voxels.push_back(entry.second);
+    return voxels;
+}
+
+ImageCoverage rasterize(const FrameView& view, const std::vector<Voxel>& voxels, double size,
+                        std::vector<int>& counts, const std::atomic<bool>* cancel) {
+    const int w = view.cam.width, h = view.cam.height;
+    ImageCoverage result;
+    if (w <= 0 || h <= 0) return result;
+    const double scale = double(kRasterSize) / std::max(w, h);
+    const int cols = std::clamp((int)std::ceil(w * scale), 1, kRasterSize);
+    const int rows = std::clamp((int)std::ceil(h * scale), 1, kRasterSize);
+    result.raster_area = cols * rows;
+    result.cell_load = 1.15 * double(w) * h / (kGiPixel * result.raster_area);
+    const double focal = std::max(std::abs(view.cam.fx), std::abs(view.cam.fy));
+    const bool wrap = camhost::full_longitude(view.cam);
+    std::vector<double> depth((size_t)result.raster_area, std::numeric_limits<double>::infinity());
+    std::vector<int> owner(depth.size(), -1);
+    for (size_t i = 0; i < voxels.size(); ++i) {
+        if (i % 4096 == 0 && cancel && cancel->load(std::memory_order_relaxed)) return {};
+        double xy[2], distance;
+        if (!frame_sees(view, voxels[i].center.data(), xy, &distance)) continue;
+        const double u = xy[0] * cols / w, v = xy[1] * rows / h;
+        const int x = std::clamp((int)u, 0, cols - 1), y = std::clamp((int)v, 0, rows - 1);
+        const double radius = std::clamp(0.5 * focal * size * scale / distance, 0.75, 4.0);
+        const int reach = (int)std::ceil(radius);
+        const int x0 = wrap ? x - reach : std::max(0, x - reach);
+        const int x1 = wrap ? x + reach : std::min(cols - 1, x + reach);
+        for (int row = std::max(0, y - reach); row <= std::min(rows - 1, y + reach); ++row)
+            for (int col = x0; col <= x1; ++col) {
+                const int px = wrap ? (col % cols + cols) % cols : col;
+                const size_t at = (size_t)row * cols + px;
+                const double dx = col + 0.5 - u, dy = row + 0.5 - v;
+                if (distance < depth[at] &&
+                    ((row == y && col == x) || dx * dx + dy * dy <= radius * radius)) {
+                    depth[at] = distance;
+                    owner[at] = (int)i;
+                }
+            }
+    }
+    for (int i : owner)
+        if (i >= 0 && counts[(size_t)i]++ == 0) result.cells.emplace_back(i, 0);
+    for (auto& [i, count] : result.cells) {
+        count = counts[(size_t)i];
+        counts[(size_t)i] = 0;
+    }
+    return result;
+}
+
+struct AxisLoads {
+    std::vector<std::pair<double, double>> prefix;
+
+    void accumulate() {
+        std::sort(prefix.begin(), prefix.end());
+        double sum = 0;
+        size_t distinct = 0;
+        for (const auto item : prefix) {
+            sum += item.second;
+            if (distinct && prefix[distinct - 1].first == item.first)
+                prefix[distinct - 1].second = sum;
+            else
+                prefix[distinct++] = {item.first, sum};
+        }
+        prefix.resize(distinct);
+    }
+    double total() const { return prefix.empty() ? 0 : prefix.back().second; }
+    size_t quantile(double fraction) const {
+        const auto it = std::lower_bound(prefix.begin(), prefix.end(), fraction * total(),
+                                         [](const auto& item, double weight) { return item.second < weight; });
+        return std::min((size_t)(it - prefix.begin()), prefix.size() - 1);
+    }
+    double before(double coordinate) const {
+        const auto it = std::lower_bound(prefix.begin(), prefix.end(), coordinate,
+                                         [](const auto& item, double value) { return item.first < value; });
+        return it == prefix.begin() ? 0 : (it - 1)->second;
+    }
+};
+
+double score_cut(double parent, double left, double right, double target) {
+    const auto improvement = [&](double load) {
+        return load > target ? std::min(1.0, 0.1 + 10.0 * (parent - load) / parent) : 1.0;
+    };
+    const auto balance = [&](double load) {
+        const double ratio = load / target;
+        return std::max(0.001, ratio < 1.0 ? ratio : std::min(1.0, 0.4 * ratio - 0.3));
+    };
+    const double waste = std::max(0.001, std::max(0.0, left + right - parent) + 0.05 * target);
+    return -waste / std::max(0.001, std::min(left, right))
+                  / improvement(left) / improvement(right) / balance(left) / balance(right);
+}
+
+bool split_block(const SpatialPart& parent, const std::vector<Voxel>& voxels, double voxel_size,
+                 double overlap_limit, double target, SpatialPart& left, SpatialPart& right,
+                 const std::atomic<bool>* cancel) {
+    std::array<AxisLoads, 3> core;
+    for (const Voxel& voxel : voxels)
+        if (voxel.load > 0 && parent.owns(voxel.center.data()))
+            for (int axis = 0; axis < 3; ++axis)
+                core[axis].prefix.emplace_back(voxel.center[axis], voxel.load);
+    if (core[0].prefix.size() < 2) return false;
+    double span[3];
+    std::array<int, 3> axes{0, 1, 2};
+    for (int axis : axes) {
+        core[axis].accumulate();
+        span[axis] = core[axis].prefix[core[axis].quantile(0.95)].first -
+                     core[axis].prefix[core[axis].quantile(0.05)].first;
+    }
+    std::stable_sort(axes.begin(), axes.end(), [&](int a, int b) { return span[a] > span[b]; });
+    double overlap = std::min(overlap_limit, std::max(span[axes.front()] * 0.05, 3.0 * voxel_size));
+    // Keep child halos inside the parent halo so their load cannot exceed its load.
+    if (parent.overlap > 0) overlap = std::min(overlap, parent.overlap);
+    const Aabb expanded = SpatialPart{parent.core, overlap}.expanded();
+    constexpr int samples[] = {150, 100, 50};
+    double best = -std::numeric_limits<double>::infinity();
+    for (int rank = 0; rank < 3; ++rank) {
+        check_cancel(cancel);
+        const int axis = axes[(size_t)rank];
+        const AxisLoads& inner = core[axis];
+        if (inner.prefix.front().first == inner.prefix.back().first) continue;
+        AxisLoads outer;
+        for (const Voxel& voxel : voxels)
+            if (voxel.load > 0 && expanded.contains(voxel.center.data()))
+                outer.prefix.emplace_back(voxel.center[axis], voxel.load);
+        outer.accumulate();
+        double last = -std::numeric_limits<double>::infinity();
+        for (int i = 1; i <= samples[rank]; ++i) {
+            const size_t j = inner.quantile(double(i) / (samples[rank] + 1));
+            const double a = inner.prefix[j].first;
+            if (j + 1 == inner.prefix.size() || a == inner.prefix[j + 1].first) continue;
+            const double cut = a * 0.5 + inner.prefix[j + 1].first * 0.5;
+            if (cut <= a || cut <= last || cut <= parent.core.lo[axis] || cut >= parent.core.hi[axis]) continue;
+            last = cut;
+            const double l = outer.before(std::nextafter(cut + overlap, std::numeric_limits<double>::infinity()));
+            const double r = outer.total() - outer.before(cut - overlap);
+            const double score = score_cut(parent.gpixels, l, r, target);
+            if (score <= best || !std::isfinite(score)) continue;
+            best = score;
+            left = {parent.core, overlap, l};
+            right = {parent.core, overlap, r};
+            left.core.hi[axis] = cut;
+            right.core.lo[axis] = cut;
+        }
+    }
+    return best >= -10.0;
+}
+
+std::vector<SpatialPart> split_space(const std::vector<Voxel>& voxels, SpatialPart root, double size,
+                                     const PartitionOptions& opt, const std::atomic<bool>* cancel) {
+    const auto lower_priority = [](const SpatialPart& a, const SpatialPart& b) {
+        if (a.gpixels != b.gpixels) return a.gpixels < b.gpixels;
+        return std::lexicographical_compare(b.core.lo, b.core.lo + 3, a.core.lo, a.core.lo + 3);
+    };
+    std::priority_queue<SpatialPart, std::vector<SpatialPart>, decltype(lower_priority)> queue(lower_priority);
+    queue.push(root);
+    const double cap = opt.lcc_overlap > 0 ? opt.lcc_overlap : std::numeric_limits<double>::infinity();
+    while (queue.top().gpixels > opt.lcc_gpixels) {
+        check_cancel(cancel);
+        if (queue.size() >= 254) throw std::runtime_error("partition: more than 254 parts");
+        SpatialPart left, right;
+        if (!split_block(queue.top(), voxels, size, cap, opt.lcc_gpixels, left, right, cancel))
+            throw std::runtime_error("partition: LCC has no valid split under the GPixels budget");
+        queue.pop();
+        queue.push(left);
+        queue.push(right);
+    }
+    std::vector<SpatialPart> out;
+    while (!queue.empty()) {
+        out.push_back(queue.top());
+        queue.pop();
+    }
+    return out;
+}
+
+void assign_training_data(const ParsedDataset& ds, const std::vector<Voxel>& voxels,
+                          const std::vector<ImageCoverage>& images, ScenePartition& p,
+                          const std::atomic<bool>* cancel) {
+    std::vector<Aabb> expanded;
+    for (const SpatialPart& block : p.spatial_parts) expanded.push_back(block.expanded());
+    std::vector<std::vector<int>> in_voxel(voxels.size());
+    for (size_t i = 0; i < voxels.size(); ++i) {
+        if (i % 4096 == 0) check_cancel(cancel);
+        if (voxels[i].load <= 0) continue;
+        for (size_t k = 0; k < expanded.size(); ++k)
+            if (expanded[k].contains(voxels[i].center.data())) in_voxel[i].push_back((int)k);
+    }
+    const size_t n = expanded.size();
+    p.frame_label.assign(images.size(), -1);
+    p.ring.resize(n);
+    p.part_points.resize(n);
+    p.core_pieces.assign(n, 0);
+    p.view_share.assign(n, 0.0f);
+    std::vector<int> best_frame(n, -1), frame_count(n, 0), coverage(n);
+    std::vector<double> best_share(n, 0), share_sum(n, 0);
+    for (size_t c = 0; c < images.size(); ++c) {
+        check_cancel(cancel);
+        const ImageCoverage& image = images[c];
+        if (image.cells.empty()) continue;
+        std::fill(coverage.begin(), coverage.end(), 0);
+        for (const auto& [voxel, count] : image.cells)
+            for (int k : in_voxel[(size_t)voxel]) coverage[(size_t)k] += count;
+        const auto primary = std::max_element(coverage.begin(), coverage.end());
+        if (*primary > kCoverage * image.raster_area) p.frame_label[c] = (int32_t)(primary - coverage.begin());
+        for (size_t k = 0; k < n; ++k) {
+            const double share = double(coverage[k]) / image.raster_area;
+            if (share > best_share[k]) {
+                best_share[k] = share;
+                best_frame[k] = (int)c;
+            }
+            if (share <= kCoverage) continue;
+            if (p.frame_label[c] != (int32_t)k) p.ring[k].push_back((int32_t)c);
+            ++frame_count[k];
+            share_sum[k] += share;
+        }
+    }
+    for (size_t k = 0; k < n; ++k) {
+        if (best_frame[k] < 0) throw std::runtime_error("partition: LCC block has no visible training image");
+        if (frame_count[k] == 0) p.ring[k].push_back(best_frame[k]);
+        p.view_share[k] = (float)(frame_count[k] ? share_sum[k] / frame_count[k] : best_share[k]);
+    }
+    p.point_label.assign((size_t)ds.points.num(), -1);
+    for (int64_t i = 0; i < ds.points.num(); ++i) {
+        if (i % 4096 == 0) check_cancel(cancel);
+        const double* q = &ds.points.xyz[(size_t)i * 3];
+        for (size_t k = 0; k < n; ++k) {
+            if (expanded[k].contains(q)) p.part_points[k].push_back(i);
+            if (p.spatial_parts[k].owns(q)) p.point_label[(size_t)i] = (int32_t)k;
+        }
+    }
+}
+
+}  // namespace
+
+void partition_lcc(const ParsedDataset& ds, ScenePartition& p, const PartitionLog& log,
+                   const std::atomic<bool>* cancel) {
+    const PartitionOptions& opt = p.options;
+    if (opt.parts != 0 || opt.max_projected_points < 1 || !std::isfinite(opt.lcc_gpixels) ||
+        opt.lcc_gpixels <= 0 || !std::isfinite(opt.lcc_voxel_size) || opt.lcc_voxel_size < 0 ||
+        !std::isfinite(opt.lcc_overlap) || opt.lcc_overlap < 0)
+        throw std::runtime_error("partition: invalid LCC pixel budget, voxel size, overlap or part count");
+    if (ds.points.num() == 0)
+        throw std::runtime_error("partition: LCC needs a seed point cloud");
+    const size_t n = (size_t)ds.num_cameras;
+    if (ds.image_filenames.size() != n || ds.widths.size() != n || ds.heights.size() != n || ds.intrins.size() != 4 * n ||
+        ds.c2w.size() != 12 * n || (!ds.camera_models.empty() && ds.camera_models.size() != n) ||
+        (!ds.camera_distortions.empty() && ds.camera_distortions.size() != n) ||
+        (!ds.dist_coeffs.empty() && ds.dist_coeffs.size() != 8 * n))
+        throw std::runtime_error("partition: LCC needs calibrated cameras");
+    Aabb bounds;
+    for (int64_t i = 0; i < ds.points.num(); ++i) {
+        if (i % 4096 == 0) check_cancel(cancel);
+        const double* q = &ds.points.xyz[(size_t)i * 3];
+        if (!std::all_of(q, q + 3, [](double v) { return std::isfinite(v); }))
+            throw std::runtime_error("partition: LCC requires finite point coordinates");
+        bounds.expand(q);
+    }
+    const double extent = std::max({bounds.hi[0] - bounds.lo[0], bounds.hi[1] - bounds.lo[1],
+                                    bounds.hi[2] - bounds.lo[2]});
+    const double size = opt.lcc_voxel_size > 0 ? opt.lcc_voxel_size : extent / 256.0;
+    if (!(size > 0) || !std::isfinite(extent) || !std::isfinite(extent + size))
+        throw std::runtime_error("partition: LCC cannot determine a voxel size for this cloud");
+    std::vector<Voxel> voxels = make_voxels(ds, bounds, size, opt.max_projected_points, cancel);
+    std::vector<ImageCoverage> images(n);
+    if (log) log("LCC: projecting " + std::to_string(voxels.size()) + " voxels");
+#pragma omp parallel
+    {
+        std::vector<int> counts(voxels.size(), 0);
+#pragma omp for schedule(dynamic, 4)
+        for (int64_t i = 0; i < ds.num_cameras; ++i) {
+            if (cancel && cancel->load(std::memory_order_relaxed)) continue;
+            images[(size_t)i] = rasterize(frame_view(ds, i), voxels, size, counts, cancel);
+        }
+    }
+    check_cancel(cancel);
+    SpatialPart root;
+    root.core = bounds;
+    for (int axis = 0; axis < 3; ++axis) {
+        const double infinity = std::numeric_limits<double>::infinity();
+        root.core.lo[axis] = std::nextafter(bounds.lo[axis] - size * 0.5, -infinity);
+        root.core.hi[axis] = std::nextafter(bounds.hi[axis] + size * 0.5, infinity);
+    }
+    for (const ImageCoverage& image : images) {
+        check_cancel(cancel);
+        for (const auto& [voxel, count] : image.cells) {
+            const double load = count * image.cell_load;
+            voxels[(size_t)voxel].load += load;
+            root.gpixels += load;
+        }
+    }
+    if (root.gpixels <= 0) throw std::runtime_error("partition: LCC found no visible seed geometry");
+    p.spatial_parts = split_space(voxels, root, size, opt, cancel);
+    p.num_parts = (int)p.spatial_parts.size();
+    p.source = CovisibilitySource::Projection;
+    assign_training_data(ds, voxels, images, p, cancel);
+    for (SpatialPart& block : p.spatial_parts)
+        for (int axis = 0; axis < 3; ++axis) {
+            block.core.lo[axis] += ds.center[(size_t)axis];
+            block.core.hi[axis] += ds.center[(size_t)axis];
+        }
+    if (log)
+        for (int k = 0; k < p.num_parts; ++k)
+            log("LCC part " + std::to_string(k) + ": " +
+                std::to_string(p.spatial_parts[(size_t)k].gpixels) + " GPixels");
+}
+
+}  // namespace spirula

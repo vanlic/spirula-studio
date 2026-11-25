@@ -189,10 +189,81 @@ void write_text(const fs::path& p, const std::string& s) {
     f << s;
 }
 
+void check_lcc_partition() {
+    using namespace spirula;
+    ParsedDataset ds = make_corridor(14, 0, 1).ds;
+    for (int x = 0; x <= 104; ++x)
+        for (int y = -12; y <= 12; ++y) {
+            ds.points.xyz.insert(ds.points.xyz.end(), {x * 0.125, y * 0.125, 0.0});
+            ds.points.rgb.insert(ds.points.rgb.end(), {128, 128, 128});
+        }
+    PartitionOptions opt;
+    opt.method = PartitionMethod::Lcc;
+    opt.lcc_voxel_size = 0.125;
+    opt.lcc_overlap = 0.125;
+    const Covisibility cov = build_covisibility(ds, nullptr, opt);
+    const ScenePartition whole = partition_scene(ds, cov, opt);
+    opt.lcc_gpixels = whole.spatial_parts.at(0).gpixels * 0.64;
+    const ScenePartition p = partition_scene(ds, cov, opt);
+    check(p.num_parts == 2 && !cov.camera_graph_built && !p.field, "LCC splits by pixel budget");
+    if (p.num_parts != 2) return;
+    const Aabb& first = p.spatial_parts[0].core;
+    const Aabb& second = p.spatial_parts[1].core;
+    int axis = 0;
+    while (axis < 3 && first.hi[axis] != second.lo[axis] && second.hi[axis] != first.lo[axis]) ++axis;
+    check(axis < 3, "LCC children share a split plane");
+    if (axis == 3) return;
+    const int left = first.lo[axis] < second.lo[axis] ? 0 : 1;
+    const int right = 1 - left;
+    const SpatialPart& a = p.spatial_parts[(size_t)left];
+    const SpatialPart& b = p.spatial_parts[(size_t)right];
+    double seam[3];
+    for (int i = 0; i < 3; ++i) seam[i] = (a.core.lo[i] + a.core.hi[i]) * 0.5;
+    seam[axis] = a.core.hi[axis];
+    check(a.gpixels <= opt.lcc_gpixels && b.gpixels <= opt.lcc_gpixels &&
+              seam[axis] == b.core.lo[axis] && !a.owns(seam) && b.owns(seam),
+          "LCC split bounds fit budget and have one seam owner");
+    const auto left_frames = p.frames_of(left), right_frames = p.frames_of(right);
+    check(p.training_region(left)->contains(seam) && p.training_region(right)->contains(seam) &&
+              std::any_of(left_frames.begin(), left_frames.end(), [&](int32_t frame) {
+                  return std::binary_search(right_frames.begin(), right_frames.end(), frame);
+              }),
+          "LCC training regions and views overlap at the cut");
+    const fs::path file = fs::temp_directory_path() / "spirula_lcc_partition_test.json";
+    write_partition(p, file.string(), "corridor");
+    const ScenePartition loaded = read_partition(file.string());
+    check(loaded.options.method == PartitionMethod::Lcc && loaded.options.lcc_gpixels == opt.lcc_gpixels &&
+              loaded.spatial_parts[(size_t)left].core.hi[axis] == seam[axis] &&
+              loaded.frame_label == p.frame_label && loaded.part_points == p.part_points &&
+              loaded.point_label == p.point_label && loaded.ring == p.ring,
+          "LCC partition file preserves bounds, frames and seed ownership");
+    ParsedDataset part_data = ds;
+    PartitionApplied applied;
+    check(apply_partition(part_data, loaded, right, applied) &&
+              part_data.num_cameras == (int64_t)loaded.frames_of(right).size() &&
+              part_data.points.num() == (int64_t)p.part_points[(size_t)right].size(),
+          "LCC part applies its training frames and halo seeds");
+    const std::string ply = (fs::temp_directory_path() / "spirula_lcc_seam_test.ply").string();
+    SplatCloud on_seam = splats_along_x(0, 0, 1, 0, 0.0f);
+    on_seam.means = {(float)seam[0], (float)seam[1], (float)seam[2]};
+    write_splat_ply(on_seam, ply);
+    MergeStats stats;
+    const auto merged = merge_partition_splats(loaded, {ply, ply}, stats);
+    check(merged.num == 1 && stats.parts[(size_t)right].kept == 1,
+          "LCC merge retains only one copy of a splat on the seam");
+    fs::remove(ply);
+    fs::remove(file);
+    fs::remove(fs::path(file).replace_extension(".bin"));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     using namespace spirula;
+    if (argc == 2 && std::string(argv[1]) == "--lcc") {
+        check_lcc_partition();
+        return g_failures != 0;
+    }
     if (argc == 4 && std::string(argv[1]) == "--camera-metadata") {
         try {
             const JsonValue config = json_parse_file(argv[2]);
@@ -249,10 +320,11 @@ int main(int argc, char** argv) {
         }
     }
     if (argc != 1) {
-        std::fprintf(stderr, "usage: scene_partition_test [--overlap-seeds DATASET PARTITION OUTPUT | --camera-metadata CONFIG DIRECTORY]\n");
+        std::fprintf(stderr, "usage: scene_partition_test [--lcc | --overlap-seeds DATASET PARTITION OUTPUT | --camera-metadata CONFIG DIRECTORY]\n");
         return 2;
     }
     check_voronoi_graph_free();
+    check_lcc_partition();
     const Corridor corr = make_corridor(60, 40, 5);
     const ParsedDataset& ds = corr.ds;
 

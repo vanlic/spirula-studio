@@ -50,7 +50,10 @@ void usage() {
     std::fprintf(stderr, "\n%s\n", P::head_split.get());
     help_row("--parts <n>", P::opt_parts);
     help_row("--max-images <n>", P::opt_max_images);
-    help_row("--method graph|viewgraph|voronoi", P::opt_method);
+    help_row("--method graph|viewgraph|voronoi|lcc", P::opt_method);
+    help_row("--gpixels <n>", P::opt_gpixels);
+    help_row("--voxel-size <size>", P::opt_lcc_voxel);
+    help_row("--overlap <size>", P::opt_lcc_overlap);
     help_row("--ring <fraction>", P::opt_ring);
     help_row("--ring-min-points <n>", P::opt_ring_min);
     help_row("--max-seeds <n>", P::opt_max_seeds);
@@ -72,7 +75,7 @@ int bad_value(const char* value, const char* flag) {
 
 int run_split(int argc, char** argv) {
     spirula::PartitionOptions opt;
-    std::string dataset, output;
+    std::string dataset, output, lcc_flag;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -88,6 +91,17 @@ int run_split(int argc, char** argv) {
         else if (a == "--ring") opt.ring_fraction = (float)std::atof(next());
         else if (a == "--ring-min-points") opt.ring_min_points = std::atoi(next());
         else if (a == "--max-seeds") opt.max_seeds = std::atoi(next());
+        else if (a == "--gpixels" || a == "--voxel-size" || a == "--overlap") {
+            const char* value = next();
+            char* end = nullptr;
+            const double v = std::strtod(value, &end);
+            if (end == value || *end || !std::isfinite(v) || v < 0 || (a == "--gpixels" && v == 0))
+                return bad_value(value, a.c_str());
+            if (a == "--gpixels") opt.lcc_gpixels = v;
+            else if (a == "--voxel-size") opt.lcc_voxel_size = v;
+            else opt.lcc_overlap = v;
+            lcc_flag = a;
+        }
         else if (a == "--max-projected-points") {
             opt.max_projected_points = std::atoi(next());
             if (opt.max_projected_points < 1) return bad_value("", "--max-projected-points");
@@ -121,15 +135,19 @@ int run_split(int argc, char** argv) {
     if (opt.parts < 0 || opt.max_images < 1 || opt.max_seeds < 1000 || opt.ring_fraction < 0)
         return bad_value("", opt.parts < 0 ? "--parts" : opt.max_images < 1 ? "--max-images"
                                           : opt.max_seeds < 1000 ? "--max-seeds" : "--ring");
+    const bool lcc = opt.method == spirula::PartitionMethod::Lcc;
+    if (!lcc && !lcc_flag.empty()) return bad_value("requires --method lcc", lcc_flag.c_str());
+    if (lcc && opt.parts != 0) return bad_value("must be 0 with --method lcc", "--parts");
 
     std::printf("%s\n", format(P::log_reading, {dataset}).c_str());
     DatasetParserConfig dcfg;
     dcfg.require_image_files = false;
     const ParsedDataset ds = parse_dataset(dataset, dcfg, "");
-    const spirula::SparseStats tracks = spirula::read_sparse_stats(dataset);
-    std::printf("%s\n", format(P::log_dataset,
-                               {(long long)ds.num_cameras, (long long)ds.points.num(),
-                                tracks.empty() ? P::word_no.get() : P::word_yes.get()}).c_str());
+    const spirula::SparseStats tracks = lcc ? spirula::SparseStats{} : spirula::read_sparse_stats(dataset);
+    if (!lcc)
+        std::printf("%s\n", format(P::log_dataset,
+                                   {(long long)ds.num_cameras, (long long)ds.points.num(),
+                                    tracks.empty() ? P::word_no.get() : P::word_yes.get()}).c_str());
 
     auto log = [](const std::string& s) { std::printf("%s\n", s.c_str()); };
     const spirula::Covisibility cov = spirula::build_covisibility(ds, &tracks, opt, log);
@@ -137,14 +155,19 @@ int run_split(int argc, char** argv) {
         std::printf("%s\n", format(P::log_covisibility,
                                    {spirula::covisibility_source_name(cov.source),
                                     (long long)(cov.cameras.adj.size() / 2)}).c_str());
-    else
+    else if (!lcc)
         std::printf("%s\n", format(P::log_covisibility_without_graph,
                                    {spirula::covisibility_source_name(cov.source)}).c_str());
-    const spirula::ScenePartition part = spirula::partition_scene(ds, cov, opt);
+    const spirula::ScenePartition part = spirula::partition_scene(ds, cov, opt, lcc ? spirula::PartitionLog(log)
+                                                                                  : spirula::PartitionLog{});
     char cut[32];
     std::snprintf(cut, sizeof cut, "%.1f", 100.0 * part.cut_fraction);
-    std::printf("%s\n", format(P::log_summary, {part.num_parts, cut,
-                                                 (long long)(part.field ? part.field->num_seeds() : 0)}).c_str());
+    if (lcc)
+        std::printf("%s\n", format(P::status_lcc, {part.num_parts, (long long)ds.num_cameras,
+                                                   (long long)ds.points.num()}).c_str());
+    else
+        std::printf("%s\n", format(P::log_summary, {part.num_parts, cut,
+                                                     (long long)(part.field ? part.field->num_seeds() : 0)}).c_str());
     for (int k = 0; k < part.num_parts; k++) {
         std::printf("%s\n", format(P::log_part, {k, (long long)part.core_count(k),
                                                  (long long)part.ring[(size_t)k].size(),
