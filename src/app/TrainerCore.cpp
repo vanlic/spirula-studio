@@ -1007,24 +1007,29 @@ std::string train_config_error(const TrainConfig& c) {
     return {};
 }
 
-void TrainerSession::apply_partition_config(ParsedDataset& d) {
-    if (cfg.partition.empty()) return;
-    const ScenePartition p = read_partition(cfg.partition);
+void TrainerSession::apply_partition_config(ParsedDataset& d, const ScenePartition& p) {
     if (cfg.partition_part < 0 || cfg.partition_part >= p.num_parts)
         throw std::runtime_error(lfmt(lmsg::err_partition_part, {p.num_parts}));
     if (&d == &ds) roi = p.training_region(cfg.partition_part);
     if (&d == &ds && (int64_t)p.point_label.size() == d.points.num()) {
-        roi_cloud = d.points.xyz;
-        roi_cloud_inside.resize(p.point_label.size());
+        roi_cloud.clear();
+        roi_cloud_inside.clear();
         if (p.spatial_parts.empty()) {
+            roi_cloud = d.points.xyz;
+            roi_cloud_inside.resize(p.point_label.size());
             for (size_t i = 0; i < p.point_label.size(); i++)
                 roi_cloud_inside[i] = p.point_label[i] == cfg.partition_part;
         } else {
             const Aabb box = p.spatial_parts[(size_t)cfg.partition_part].expanded();
+            const bool filtered = p.options.lcc_min_track_length > 0;
+            if (!filtered) roi_cloud = d.points.xyz;
+            roi_cloud_inside.reserve(p.point_label.size());
             for (size_t i = 0; i < p.point_label.size(); i++) {
-                const double q[3] = {roi_cloud[i * 3] + d.center[0], roi_cloud[i * 3 + 1] + d.center[1],
-                                     roi_cloud[i * 3 + 2] + d.center[2]};
-                roi_cloud_inside[i] = box.contains(q);
+                if (filtered && p.point_label[i] < 0) continue;
+                const double* xyz = &d.points.xyz[i * 3];
+                if (filtered) roi_cloud.insert(roi_cloud.end(), xyz, xyz + 3);
+                const double q[3] = {xyz[0] + d.center[0], xyz[1] + d.center[1], xyz[2] + d.center[2]};
+                roi_cloud_inside.push_back(box.contains(q));
             }
         }
     }
@@ -1263,6 +1268,13 @@ void TrainerSession::load_dataset() {
         else cfg.roi_region = "off";
         return;
     }
+    std::optional<ScenePartition> partition;
+    if (!cfg.partition.empty()) partition = read_partition(cfg.partition);
+    if (partition && partition->options.lcc_min_track_length > 0) {
+        if (!cfg.seed_pointcloud.empty() && cfg.seed_pointcloud != spirula::dense::kSparseSeed)
+            throw std::runtime_error("Track-filtered LCC requires sparse seed points");
+        cfg.seed_pointcloud = spirula::dense::kSparseSeed;
+    }
     // Written back into cfg, so config.json names the cloud this run used.
     if (cfg.seed_pointcloud.empty() && cfg.resume.empty() && cfg.random_init != "always" &&
         (cfg.init_ply.empty() || cfg.init_ply_add_points)) {
@@ -1298,7 +1310,7 @@ void TrainerSession::load_dataset() {
     pcfg.metashape_psx           = cfg.metashape_psx;
     ds = parse_dataset(cfg.data, pcfg, cfg.data_format);
     roi.reset();
-    apply_partition_config(ds);
+    if (partition) apply_partition_config(ds, *partition);
     load_region();
     // `gsplat` needs seed points; without them `up` / `poses` were used.
     if (ds.pose_normalization_fell_back)
@@ -2512,7 +2524,7 @@ void TrainerSession::eval(const std::function<void(const EvalProgress&)>& on_pro
     pcfg.split                   = "eval";
 
     ParsedDataset eds = parse_dataset(cfg.data, pcfg, cfg.data_format);
-    apply_partition_config(eds);
+    if (!cfg.partition.empty()) apply_partition_config(eds, read_partition(cfg.partition));
     if (eds.num_cameras == 0) {
         log(lmsg::eval_split_empty.get());
         return;

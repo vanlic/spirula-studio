@@ -226,6 +226,29 @@ SS_MSG(lbl_lcc_overlap,
     RU("Макс. перекрытие"),
     TR("Azami örtüşme"));
 
+SS_MSG(lbl_lcc_min_track_length,
+    EN("Min. track length"), JA("最小トラック長"),
+    ZH_HANS("最少 Track 观测数"), ZH_HANT("最少 Track 觀測數"),
+    KO("최소 트랙 길이"), DE("Min. Tracklänge"),
+    FR("Longueur min. de piste"), ES("Longitud mín. de pista"),
+    PT("Comp. mín. da trilha"), IT("Lunghezza min. traccia"),
+    NL("Min. spoorlengte"), RU("Мин. длина трека"), TR("En az iz uzunluğu"));
+
+SS_MSG(opt_lcc_min_track_length,
+    EN("Minimum COLMAP image observations per seed point. 0 keeps all points."),
+    JA("種点ごとの COLMAP 画像観測数の下限。0 で全点を保持します。"),
+    ZH_HANS("每个种子点所需的最少 COLMAP 图像观测数。0 保留所有点。"),
+    ZH_HANT("每個種子點所需的最少 COLMAP 影像觀測數。0 保留所有點。"),
+    KO("시드 점당 최소 COLMAP 이미지 관측 수입니다. 0은 모든 점을 유지합니다."),
+    DE("Min. COLMAP-Bildbeobachtungen je Startpunkt. 0 behält alle Punkte."),
+    FR("Nombre min. d'observations COLMAP par point initial. 0 garde tous les points."),
+    ES("Mín. de observaciones COLMAP por punto inicial. 0 conserva todos los puntos."),
+    PT("Mín. de observações COLMAP por ponto inicial. 0 mantém todos os pontos."),
+    IT("Min. osservazioni COLMAP per punto iniziale. 0 conserva tutti i punti."),
+    NL("Min. COLMAP-beeldwaarnemingen per startpunt. 0 behoudt alle punten."),
+    RU("Мин. число наблюдений COLMAP на исходную точку. 0 сохраняет все точки."),
+    TR("Başlangıç noktası başına en az COLMAP gözlemi. 0 tüm noktaları tutar."));
+
 SS_MSG(opt_gpixels,
     EN("LCC visible pixel budget per block in GPixels. Default: 16."),
     JA("LCC のブロックごとの可視画素上限（GPixels）。既定値: 16。"),

@@ -52,6 +52,7 @@ struct PartitionOptions {
     double lcc_gpixels = 16.0;
     double lcc_voxel_size = 0.0;
     double lcc_overlap = 0.0;
+    int lcc_min_track_length = 0;
 };
 
 // Projection rows are shared by nearby file-order points to bound observer storage.
@@ -136,7 +137,8 @@ struct ScenePartition {
 // PartitionCancelled once `cancel` is set.
 ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
                                const PartitionOptions& opt, const PartitionLog& log = {},
-                               const std::atomic<bool>* cancel = nullptr);
+                               const std::atomic<bool>* cancel = nullptr,
+                               const SparseStats* tracks = nullptr);
 
 // partition.json beside a `.bin` of the same stem holding the volume and the
 // point tables. `dataset` is recorded as given.

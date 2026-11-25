@@ -30,17 +30,24 @@ struct ImageCoverage {
     double cell_load = 0;
 };
 
+struct SeedRows {
+    int64_t count;
+    std::vector<int64_t> kept;
+
+    int64_t operator[](int64_t i) const { return kept.empty() ? i : kept[(size_t)i]; }
+};
+
 void check_cancel(const std::atomic<bool>* cancel) {
     if (cancel && cancel->load(std::memory_order_relaxed)) throw PartitionCancelled();
 }
 
-std::vector<Voxel> make_voxels(const ParsedDataset& ds, const Aabb& bounds, double size,
-                              int limit, const std::atomic<bool>* cancel) {
-    const int64_t stride = 1 + (ds.points.num() - 1) / limit;
+std::vector<Voxel> make_voxels(const ParsedDataset& ds, const SeedRows& seeds, const Aabb& bounds,
+                              double size, int limit, const std::atomic<bool>* cancel) {
+    const int64_t stride = 1 + (seeds.count - 1) / limit;
     std::map<std::array<int64_t, 3>, Voxel> grid;
-    for (int64_t i = 0; i < ds.points.num(); i += stride) {
+    for (int64_t i = 0; i < seeds.count; i += stride) {
         if ((i / stride) % 4096 == 0) check_cancel(cancel);
-        const double* q = &ds.points.xyz[(size_t)i * 3];
+        const double* q = &ds.points.xyz[(size_t)seeds[i] * 3];
         std::array<int64_t, 3> cell;
         Voxel voxel;
         for (int axis = 0; axis < 3; ++axis) {
@@ -274,7 +281,7 @@ std::vector<SpatialPart> split_space(const std::vector<Voxel>& voxels, SpatialPa
     return out;
 }
 
-void assign_training_data(const ParsedDataset& ds, const std::vector<Voxel>& voxels,
+void assign_training_data(const ParsedDataset& ds, const SeedRows& seeds, const std::vector<Voxel>& voxels,
                           const std::vector<ImageCoverage>& images, ScenePartition& p,
                           const std::atomic<bool>* cancel) {
     std::vector<Aabb> expanded;
@@ -321,20 +328,21 @@ void assign_training_data(const ParsedDataset& ds, const std::vector<Voxel>& vox
         p.view_share[k] = (float)(frame_count[k] ? share_sum[k] / frame_count[k] : best_share[k]);
     }
     p.point_label.assign((size_t)ds.points.num(), -1);
-    for (int64_t i = 0; i < ds.points.num(); ++i) {
+    for (int64_t i = 0; i < seeds.count; ++i) {
         if (i % 4096 == 0) check_cancel(cancel);
-        const double* q = &ds.points.xyz[(size_t)i * 3];
+        const int64_t row = seeds[i];
+        const double* q = &ds.points.xyz[(size_t)row * 3];
         for (size_t k = 0; k < n; ++k) {
-            if (expanded[k].contains(q)) p.part_points[k].push_back(i);
-            if (p.spatial_parts[k].owns(q)) p.point_label[(size_t)i] = (int32_t)k;
+            if (expanded[k].contains(q)) p.part_points[k].push_back(row);
+            if (p.spatial_parts[k].owns(q)) p.point_label[(size_t)row] = (int32_t)k;
         }
     }
 }
 
 }  // namespace
 
-void partition_lcc(const ParsedDataset& ds, ScenePartition& p, const PartitionLog& log,
-                   const std::atomic<bool>* cancel) {
+void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePartition& p,
+                   const PartitionLog& log, const std::atomic<bool>* cancel) {
     const PartitionOptions& opt = p.options;
     if (opt.parts != 0 || opt.max_projected_points < 1 || !std::isfinite(opt.lcc_gpixels) ||
         opt.lcc_gpixels <= 0 || !std::isfinite(opt.lcc_voxel_size) || opt.lcc_voxel_size < 0 ||
@@ -342,6 +350,24 @@ void partition_lcc(const ParsedDataset& ds, ScenePartition& p, const PartitionLo
         throw std::runtime_error("partition: invalid LCC pixel budget, voxel size, overlap or part count");
     if (ds.points.num() == 0)
         throw std::runtime_error("partition: LCC needs a seed point cloud");
+    if (opt.lcc_min_track_length < 0)
+        throw std::runtime_error("partition: LCC minimum track length must be nonnegative");
+    SeedRows seeds{ds.points.num(), {}};
+    if (opt.lcc_min_track_length > 0) {
+        if (!tracks || !tracks_usable(ds, *tracks))
+            throw std::runtime_error("partition: LCC track filtering requires matching COLMAP tracks");
+        const auto& begins = tracks->track_beg;
+        for (int64_t i = 0; i < ds.points.num(); ++i) {
+            if (i % 4096 == 0) check_cancel(cancel);
+            if (begins[(size_t)i + 1] - begins[(size_t)i] >= opt.lcc_min_track_length)
+                seeds.kept.push_back(i);
+        }
+        seeds.count = (int64_t)seeds.kept.size();
+        if (log) log("LCC: kept " + std::to_string(seeds.count) + " of " +
+                     std::to_string(ds.points.num()) + " seed points after track filtering");
+        if (seeds.count == 0)
+            throw std::runtime_error("partition: LCC track filtering removed all seed points");
+    }
     const size_t n = (size_t)ds.num_cameras;
     if (ds.image_filenames.size() != n || ds.widths.size() != n || ds.heights.size() != n || ds.intrins.size() != 4 * n ||
         ds.c2w.size() != 12 * n || (!ds.camera_models.empty() && ds.camera_models.size() != n) ||
@@ -349,9 +375,9 @@ void partition_lcc(const ParsedDataset& ds, ScenePartition& p, const PartitionLo
         (!ds.dist_coeffs.empty() && ds.dist_coeffs.size() != 8 * n))
         throw std::runtime_error("partition: LCC needs calibrated cameras");
     Aabb bounds;
-    for (int64_t i = 0; i < ds.points.num(); ++i) {
+    for (int64_t i = 0; i < seeds.count; ++i) {
         if (i % 4096 == 0) check_cancel(cancel);
-        const double* q = &ds.points.xyz[(size_t)i * 3];
+        const double* q = &ds.points.xyz[(size_t)seeds[i] * 3];
         if (!std::all_of(q, q + 3, [](double v) { return std::isfinite(v); }))
             throw std::runtime_error("partition: LCC requires finite point coordinates");
         bounds.expand(q);
@@ -361,7 +387,7 @@ void partition_lcc(const ParsedDataset& ds, ScenePartition& p, const PartitionLo
     const double size = opt.lcc_voxel_size > 0 ? opt.lcc_voxel_size : extent / 256.0;
     if (!(size > 0) || !std::isfinite(extent) || !std::isfinite(extent + size))
         throw std::runtime_error("partition: LCC cannot determine a voxel size for this cloud");
-    std::vector<Voxel> voxels = make_voxels(ds, bounds, size, opt.max_projected_points, cancel);
+    std::vector<Voxel> voxels = make_voxels(ds, seeds, bounds, size, opt.max_projected_points, cancel);
     std::vector<ImageCoverage> images(n);
     if (log) log("LCC: projecting " + std::to_string(voxels.size()) + " voxels");
 #pragma omp parallel
@@ -402,7 +428,7 @@ void partition_lcc(const ParsedDataset& ds, ScenePartition& p, const PartitionLo
     p.spatial_parts = split_space(voxels, root, size, opt, cancel);
     p.num_parts = (int)p.spatial_parts.size();
     p.source = CovisibilitySource::Projection;
-    assign_training_data(ds, voxels, images, p, cancel);
+    assign_training_data(ds, seeds, voxels, images, p, cancel);
     for (SpatialPart& block : p.spatial_parts)
         for (int axis = 0; axis < 3; ++axis) {
             block.core.lo[axis] += ds.center[(size_t)axis];

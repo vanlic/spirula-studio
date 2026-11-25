@@ -170,7 +170,7 @@ void PartitionPanel::run_compute() {
         _cov_opt = opt;
         _cov_valid = true;
     }
-    spirula::ScenePartition part = spirula::partition_scene(_ds, _cov, opt, log, &_cancel);
+    spirula::ScenePartition part = spirula::partition_scene(_ds, _cov, opt, log, &_cancel, &_tracks);
     if (_cancel.load()) throw spirula::PartitionCancelled();
     std::vector<spirula::RegionMesh> meshes;
     if (lcc) {
@@ -239,12 +239,17 @@ void PartitionPanel::poll() {
     switch (job) {
         case Job::Load:
             _status.clear();
+            if (!spirula::tracks_usable(_ds, _tracks)) _opt.lcc_min_track_length = 0;
             _view_dirty = true;
             break;
         case Job::Compute:
             _part = std::move(_new_part);
             _part_meshes = std::move(_new_meshes);
             _part_opt = _compute_opt;
+            _part_seed_count = _ds.points.num();
+            if (_part.options.lcc_min_track_length > 0)
+                _part_seed_count = std::count_if(_part.point_label.begin(), _part.point_label.end(),
+                                                [](int32_t label) { return label >= 0; });
             _part_valid = true;
             _status.clear();
             _saved_path.clear();
@@ -270,7 +275,7 @@ bool PartitionPanel::options_changed() const {
            a.max_seeds != b.max_seeds ||
            a.max_projected_points != b.max_projected_points ||
            a.lcc_gpixels != b.lcc_gpixels || a.lcc_voxel_size != b.lcc_voxel_size ||
-           a.lcc_overlap != b.lcc_overlap ||
+           a.lcc_overlap != b.lcc_overlap || a.lcc_min_track_length != b.lcc_min_track_length ||
            a.projection_depth_slack != b.projection_depth_slack ||
            a.proximity_neighbours != b.proximity_neighbours ||
            a.source != b.source;
@@ -321,8 +326,10 @@ void PartitionPanel::refresh_view() {
             show.points.rgb.clear();
             show.points.xyz.reserve((size_t)n_pts * 3);
             show.points.rgb.reserve((size_t)n_pts * 3);
+            const bool filtered = _part.options.lcc_min_track_length > 0;
             for (int64_t i = 0; i < n_pts; i++) {
                 const int label = _part.point_label[(size_t)i];
+                if (filtered && label < 0) continue;
                 if (solo >= 0 && !in_part[(size_t)i]) continue;
                 for (int k = 0; k < 3; k++) show.points.xyz.push_back(_ds.points.xyz[(size_t)i * 3 + k]);
                 float c[3];
@@ -414,7 +421,7 @@ void PartitionPanel::draw_controls() {
         ui::TextDisabledWrapped(*_notice);
     } else if (_part_valid && !_part.spatial_parts.empty()) {
         ui::TextWrapped(pmsg::status_lcc, {_part.num_parts, (long long)_ds.num_cameras,
-                                         (long long)_ds.points.num()});
+                                         (long long)_part_seed_count});
     } else if (_part_valid) {
         char cut[32];
         std::snprintf(cut, sizeof cut, "%.1f", 100.0 * _part.cut_fraction);
@@ -447,6 +454,12 @@ void PartitionPanel::draw_controls() {
         if (ui::InputDouble(pmsg::lbl_lcc_overlap, &_opt.lcc_overlap, "%g"))
             _opt.lcc_overlap = std::max(0.0, _opt.lcc_overlap);
         ui::help_on_hover(pmsg::opt_lcc_overlap);
+        ImGui::BeginDisabled(!_loaded || !spirula::tracks_usable(_ds, _tracks));
+        ImGui::SetNextItemWidth(px(120.0f));
+        if (ui::InputInt(pmsg::lbl_lcc_min_track_length, &_opt.lcc_min_track_length))
+            _opt.lcc_min_track_length = std::max(0, _opt.lcc_min_track_length);
+        ui::help_on_hover_disabled(pmsg::opt_lcc_min_track_length);
+        ImGui::EndDisabled();
     } else {
         ImGui::SetNextItemWidth(px(-80.0f));
         if (ui::Combo(pmsg::lbl_source, &_source_idx,

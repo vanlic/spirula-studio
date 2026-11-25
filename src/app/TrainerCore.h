@@ -33,6 +33,7 @@
 namespace spirula {
 
 struct RegionCameras;
+struct ScenePartition;
 
 // ===========================================================================
 // Color-space handling
@@ -276,7 +277,7 @@ public:
     void load_dataset();
     // --partition / --partition-part: keeps one part's frames and points of a
     // freshly parsed dataset. A no-op without the flag.
-    void apply_partition_config(ParsedDataset& d);
+    void apply_partition_config(ParsedDataset& d, const ScenePartition& p);
     // The region the run may grow in (data/Region.h): the partition's part,
     // --roi-region (by default the dataset's first roi/*.json), or both
     // intersected. Null for all of space.

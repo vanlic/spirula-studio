@@ -286,6 +286,52 @@ void check_lcc_tight_budget() {
           "LCC reports when an individual voxel already exceeds the budget");
 }
 
+void check_lcc_track_filter() {
+    using namespace spirula;
+    ParsedDataset ds = make_corridor(3, 0, 1).ds;
+    ds.points.xyz = {0, 0, 0, 1, 0, -20, 2, 0, 0, 1, 0, 0};
+    ds.points.rgb.assign(ds.points.xyz.size(), 128);
+    SparseStats tracks;
+    tracks.track_beg = {0, 3, 5, 8, 10};
+    tracks.track_image = {0, 1, 2, 0, 1, 0, 1, 2, 1, 2};
+    PartitionOptions opt;
+    opt.method = PartitionMethod::Lcc;
+    opt.lcc_voxel_size = 0.125;
+    const Covisibility cov = build_covisibility(ds, &tracks, opt);
+    const ScenePartition whole = partition_scene(ds, cov, opt);
+    opt.lcc_min_track_length = 3;
+    const ScenePartition p = partition_scene(ds, cov, opt, {}, nullptr, &tracks);
+    check(p.num_parts == 1 && whole.spatial_parts[0].core.lo[2] < -20 &&
+              p.spatial_parts[0].core.lo[2] > -0.1 &&
+              p.point_label == std::vector<int32_t>{0, -1, 0, -1} &&
+              p.part_points[0] == std::vector<int64_t>{0, 2},
+          "LCC track filter drops short tracks before bounds and training assignment");
+
+    const fs::path file = fs::temp_directory_path() / "spirula_lcc_track_filter_test.json";
+    write_partition(p, file.string(), "corridor");
+    const ScenePartition loaded = read_partition(file.string());
+    ParsedDataset training_ds = ds;
+    PartitionApplied summary;
+    check(loaded.options.lcc_min_track_length == 3 &&
+              apply_partition(training_ds, loaded, 0, summary) && summary.points_after == 2 &&
+              training_ds.points.xyz == std::vector<double>{0, 0, 0, 2, 0, 0},
+          "LCC saves the track filter and keeps only its retained training seeds");
+    fs::remove(file);
+    fs::remove(fs::path(file).replace_extension(".bin"));
+
+    std::string error;
+    try { partition_scene(ds, cov, opt); }
+    catch (const std::runtime_error& e) { error = e.what(); }
+    check(error.find("requires matching COLMAP tracks") != std::string::npos,
+          "LCC reports when track filtering is requested without a matching track table");
+    error.clear();
+    opt.lcc_min_track_length = 4;
+    try { partition_scene(ds, cov, opt, {}, nullptr, &tracks); }
+    catch (const std::runtime_error& e) { error = e.what(); }
+    check(error.find("removed all seed points") != std::string::npos,
+          "LCC reports when no points meet the track threshold");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -293,6 +339,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--lcc") {
         check_lcc_partition();
         check_lcc_tight_budget();
+        check_lcc_track_filter();
         return g_failures != 0;
     }
     if (argc == 4 && std::string(argv[1]) == "--camera-metadata") {
@@ -357,6 +404,7 @@ int main(int argc, char** argv) {
     check_voronoi_graph_free();
     check_lcc_partition();
     check_lcc_tight_budget();
+    check_lcc_track_filter();
     const Corridor corr = make_corridor(60, 40, 5);
     const ParsedDataset& ds = corr.ds;
 

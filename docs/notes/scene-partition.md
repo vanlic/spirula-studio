@@ -43,6 +43,11 @@ weighted span, then is capped by the parent padding and the user limit.
 The method uses its pixel budget and projection in place of the part count,
 camera cap, covisibility source and camera ring controls.
 
+`--min-track-length` (Min. track length in the panel) keeps seed points with
+at least that many COLMAP image observations. It applies before computing
+bounds, projecting voxels and choosing the training seeds. Use 0 to keep
+all points. Each image contributes its own observation.
+
 Training uses an expanded box for its seeds and ROI. Images with more than
 3% coarse pixel coverage in the expanded box are shared across blocks as
 needed. A block with lower coverage uses its best visible image. Merging

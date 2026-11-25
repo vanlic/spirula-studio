@@ -82,6 +82,7 @@ private:
     spirula::PartitionOptions _part_opt;  // the options _part was built with
     spirula::PartitionOptions _compute_opt;   // the options the running compute uses
     bool _part_valid = false;
+    int64_t _part_seed_count = 0;
     // A finished compute's result, moved into _part by poll() on the GUI thread.
     spirula::ScenePartition _new_part;
     std::vector<spirula::RegionMesh> _new_meshes;
