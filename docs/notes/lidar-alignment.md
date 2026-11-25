@@ -33,6 +33,20 @@ add camera centre priors with a 5 cm standard deviation. The file has one
 
 ## Timed LiDAR supervision
 
+For scan-only training, choose **LiDAR training** on the home screen or in the
+training preset menu. Select the LAS/LAZ and its existing `frame.csv` or
+`frames.csv`, then start the run.
+
+```bash
+spirula train lidar --lidar-scan scan.laz --lidar-poses frames.csv
+```
+
+The original `frame_id,time_sec,x,y,z,qx,qy,qz,qw` header works as-is. The
+trainer uses `time_sec,x,y,z` to interpolate the scan origin. Both files must use
+the same clock and metric coordinate frame. The scan-only preset optimizes
+geometry at a fixed splat count, using scan RGB for the initial colors when
+available.
+
 Timed depth supervision supports an already aligned COLMAP model, with or
 without photo depth maps from `spirula lidar`.
 

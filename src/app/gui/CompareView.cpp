@@ -9,7 +9,6 @@
 #include "app/gui/edit/PointsDoc.h"
 #include "app/gui/edit/SplatDoc.h"
 #include "checkpoint/SplatPly.h"
-#include "core/Camera.h"
 #include "core/HostMemory.h"
 #include "backend/api/BackendRuntime.h"
 #include "data/Json.h"
@@ -276,29 +275,7 @@ void CompareView::ensure_viewer_overlay() {
     const float radius = unit / 1.25f;
     const float* c = ref.frame_center();
     std::lock_guard<std::mutex> lk(_engine_mutex);
-    // engine_blit_view refuses to run before engine_viewer_init, and that
-    // wants at least one camera -- so a file with none gets a placeholder,
-    // sized to nothing and drawn by nothing. The overlay state is the point.
-    std::vector<float> intrins{32, 32, 32, 32};
-    std::vector<float> dist((size_t)kCameraDistortionParams, 0.0f);
-    std::vector<float> c2w{1, 0, 0, c[0],
-                           0, 1, 0, c[1],
-                           0, 0, 1, c[2]};
-    std::vector<int32_t> models_i{0}, w_i{64}, h_i{64},   // 0 = PINHOLE
-                         dist_tier{0};                    // 0 = None
-    auto tvf = [](std::vector<float>& v, std::vector<int64_t> shape) {
-        return TorchTensorView{(uint64_t)(uintptr_t)v.data(),
-                               (uint32_t)sizeof(float), std::move(shape)};
-    };
-    auto tvi = [](std::vector<int32_t>& v, std::vector<int64_t> shape) {
-        return TorchTensorView{(uint64_t)(uintptr_t)v.data(),
-                               (uint32_t)sizeof(int32_t), std::move(shape)};
-    };
-    engine_viewer_init(tvi(models_i, {1}), tvf(intrins, {1, 4}),
-                       tvf(dist, {1, kCameraDistortionParams}),
-                       tvi(dist_tier, {1}), tvf(c2w, {1, 3, 4}),
-                       tvi(w_i, {1}), tvi(h_i, {1}),
-                       /*camera_size=*/radius * 1e-3f);
+    viewer_upload_placeholder_camera(c, radius * 1e-3f);
     engine_viewer_set_grid(radius, unit);
 }
 

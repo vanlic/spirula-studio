@@ -1112,6 +1112,25 @@ void TrainerSession::setup_region() {
 }
 
 void TrainerSession::check_config() {
+    if (cfg.lidar_only) {
+        if (cfg.lidar_scan.empty() || cfg.lidar_poses.empty())
+            throw std::runtime_error("The LiDAR preset requires --lidar-scan and --lidar-poses");
+        if (!(cfg.lidar_weight > 0.0f))
+            throw std::runtime_error("The LiDAR preset requires a positive --lidar-weight");
+        if (!cfg.partition.empty())
+            throw std::runtime_error("Image-dataset partitions cannot be used for LiDAR-only training");
+        cfg.lidar_scan = fs::absolute(fs::u8path(cfg.lidar_scan)).lexically_normal().u8string();
+        cfg.lidar_poses = fs::absolute(fs::u8path(cfg.lidar_poses)).lexically_normal().u8string();
+        cfg.data = fs::u8path(cfg.lidar_scan).parent_path().u8string();
+        cfg.eval_mode = "all";
+        cfg.validation_fraction = 0;
+        cfg.progressive_resolution = false;
+        cfg.use_bilateral_grid = false;
+        cfg.use_ppisp = false;
+        cfg.use_calib_warp = false;
+        cfg.refine_every = 0;
+        cfg.pca_reg_neighbors = 0;
+    }
     if (!cfg.lidar_scan.empty() || !cfg.lidar_poses.empty()) {
         if (cfg.lidar_scan.empty() || cfg.lidar_poses.empty() ||
             !std::isfinite(cfg.lidar_weight) || cfg.lidar_weight < 0.0f)
@@ -1202,7 +1221,48 @@ void TrainerSession::seed_at_random() {
              {(long long)rc.count, rc.distribution, rc.center, sigma, mode}));
 }
 
+void TrainerSession::load_lidar_scan() {
+    lidar.reset();
+    if (cfg.lidar_scan.empty() || cfg.lidar_weight <= 0.0f) return;
+    const auto resolve = [&](const std::string& name) {
+        const auto path = fs::u8path(name);
+        return (fs::u8path(cfg.data) / path).u8string();
+    };
+    ColmapPoints3D seeds;
+    const bool seed_from_scan = cfg.lidar_only ||
+        (cfg.resume.empty() && cfg.init_ply.empty() && cfg.random_init != "always");
+    lidar = std::make_unique<app::lidar::TrainingScan>(
+        resolve(cfg.lidar_scan), resolve(cfg.lidar_poses), seed_from_scan ? &seeds : nullptr,
+        cfg.lidar_only);
+    if (cfg.lidar_only) {
+        const auto center = dsparse::resolve_scene_center(cfg.scene_center, cfg.scene_center_threshold,
+            nullptr, 0, seeds.xyz.data(), seeds.num());
+        ds.center = center.center;
+        ds.center_mode = dsparse::kCenterModeNames[(int)center.mode];
+    }
+    for (size_t i = 0; i < seeds.xyz.size(); ++i) seeds.xyz[i] -= ds.center[i % 3];
+    log("[lidar] " + std::to_string(lidar->frame_count()) + " scan windows, " +
+        std::to_string(lidar->point_count()) + " timed returns, " +
+        std::to_string(seeds.num()) + " scan seeds");
+    if (cfg.lidar_only) {
+        ds.points = std::move(seeds);
+    } else {
+        ds.points.xyz.insert(ds.points.xyz.end(), seeds.xyz.begin(), seeds.xyz.end());
+        ds.points.rgb.insert(ds.points.rgb.end(), seeds.rgb.begin(), seeds.rgb.end());
+    }
+}
+
 void TrainerSession::load_dataset() {
+    if (cfg.lidar_only) {
+        ds = {};
+        ds.gauge_metric = true;
+        post = {};
+        load_lidar_scan();
+        roi.reset();
+        if (!cfg.roi_region.empty() && cfg.roi_region != "off") load_region();
+        else cfg.roi_region = "off";
+        return;
+    }
     // Written back into cfg, so config.json names the cloud this run used.
     if (cfg.seed_pointcloud.empty() && cfg.resume.empty() && cfg.random_init != "always" &&
         (cfg.init_ply.empty() || cfg.init_ply_add_points)) {
@@ -1288,24 +1348,7 @@ void TrainerSession::load_dataset() {
         ds.normalized_rotation = {1,0,0, 0,1,0, 0,0,1};
     }
 
-    lidar.reset();
-    if (!cfg.lidar_scan.empty() && cfg.lidar_weight > 0.0f) {
-        const auto resolve = [&](const std::string& name) {
-            const auto path = fs::u8path(name);
-            return (path.is_absolute() ? path : fs::u8path(cfg.data) / path).u8string();
-        };
-        std::vector<double> scan_seeds;
-        const bool seed_from_scan = cfg.resume.empty() && cfg.init_ply.empty() &&
-                                    cfg.random_init != "always";
-        lidar = std::make_unique<app::lidar::TrainingScan>(
-            resolve(cfg.lidar_scan), resolve(cfg.lidar_poses), seed_from_scan ? &scan_seeds : nullptr);
-        for (size_t i = 0; i < scan_seeds.size(); ++i) scan_seeds[i] -= ds.center[i % 3];
-        ds.points.xyz.insert(ds.points.xyz.end(), scan_seeds.begin(), scan_seeds.end());
-        ds.points.rgb.insert(ds.points.rgb.end(), scan_seeds.size(), uint8_t(128));
-        log("[lidar] " + std::to_string(lidar->frame_count()) + " scan windows, " +
-            std::to_string(lidar->point_count()) + " timed returns, " +
-            std::to_string(scan_seeds.size() / 3) + " scan seeds");
-    }
+    load_lidar_scan();
     seed_at_random();
 
     // POST-split camera bake (identity when no warp flag applies).
@@ -1520,8 +1563,8 @@ void TrainerSession::setup_engine() {
         std::time_t t = std::time(nullptr);
         char stamp[32];
         std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", std::localtime(&t));
-        out_dir = fs::path(cfg.output_dir_prefix) /
-                  (fs::path(cfg.data).stem().string() + "_" + stamp);
+        const auto input = fs::u8path(cfg.lidar_only ? cfg.lidar_scan : cfg.data);
+        out_dir = fs::u8path(cfg.output_dir_prefix) / fs::u8path(input.stem().u8string() + "_" + stamp);
     }
     fs::create_directories(out_dir);
     if (write_config_json) {
@@ -1562,7 +1605,7 @@ void TrainerSession::setup_engine() {
     setup_region();
     // Pixels showing only what lies outside the region train nothing the
     // merge keeps, and pull splats in front of the camera to explain them.
-    if (roi && cfg.roi_mask_pixels) {
+    if (!cfg.lidar_only && roi && cfg.roi_mask_pixels) {
         // The partition's own labels over its whole cloud when there is one;
         // otherwise the region asked about the part's seed points.
         const double rs = cfg.relative_scale.value_or(1.0f);
@@ -1689,7 +1732,7 @@ void TrainerSession::setup_engine() {
             log(divisor > 1 ? lfmt(lmsg::progressive_stage, {(long long)divisor, (long long)from})
                             : lfmt(lmsg::progressive_stage_full, {(long long)from}));
     }
-    engine_setup_data_manager(
+    if (!cfg.lidar_only) engine_setup_data_manager(
         dm, ds.camera_models, ds.camera_distortions,
         ds.image_filenames,
         has_mask ? ds.mask_filenames : std::vector<std::string>{},
@@ -1929,9 +1972,10 @@ std::map<std::string, float> TrainerSession::train_step(int step) {
     LidarTrainingView view;
     if (lidar && lidar->sample(step, ds.center, view))
         lidar_loss = engine_train_lidar_view(view, cfg.lidar_weight, step, cfg.primitive, cfg.packed, sc);
-    auto losses = engine_train_step_managed(
-        step, cfg.num_iterations, cfg.primitive, sh_degree_to_use,
-        cfg.packed, sc);
+    std::map<std::string, float> losses;
+    if (!cfg.lidar_only)
+        losses = engine_train_step_managed(step, cfg.num_iterations, cfg.primitive, sh_degree_to_use,
+                                           cfg.packed, sc);
     if (lidar_loss) {
         losses["lidar_depth_loss"] = *lidar_loss;
         losses["lidar_samples"] = float(view.samples.size());

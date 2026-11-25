@@ -704,12 +704,23 @@ float viewer_camera_size_heuristic(const PostSplitCameras& post) {
     return (float)camhost::frustum_display_size(post.c2w_flip.data(), post.n_post);
 }
 
+void viewer_upload_placeholder_camera(const float center[3], float size) {
+    const float intr[] = {32, 32, 32, 32};
+    const float dist[kCameraDistortionParams] = {};
+    const float c2w[] = {1, 0, 0, center[0], 0, 1, 0, center[1], 0, 0, 1, center[2]};
+    const int32_t pinhole = 0, no_distortion = 0, pixels = 64;
+    engine_viewer_init(tvp(&pinhole, 4, {1}), tvp(intr, 4, {1, 4}),
+                       tvp(dist, 4, {1, kCameraDistortionParams}), tvp(&no_distortion, 4, {1}),
+                       tvp(c2w, 4, {1, 3, 4}), tvp(&pixels, 4, {1}), tvp(&pixels, 4, {1}), size);
+}
+
 float viewer_upload_cameras(const PostSplitCameras& post) {
-    // No training cameras is a legitimate state: serving a bare PLY has none.
-    // Skip the upload rather than initializing an empty camera table -- the
-    // frustum overlay and the thumbnail cache simply have nothing to draw,
-    // and engine_viewer_init rejects N_post=0.
-    if (post.n_post <= 0) return 0.0f;
+    if (post.n_post <= 0) {
+        // The blitter needs a camera slot even when frusta are disabled.
+        const float origin[3] = {};
+        viewer_upload_placeholder_camera(origin, 0.0f);
+        return 0.0f;
+    }
     float camera_size = viewer_camera_size_heuristic(post);
     engine_viewer_init(
         tvp(post.post_models.data(), 4, {post.n_post}),

@@ -277,6 +277,7 @@ inline bool train_choice_valid(const std::string& value, const char* choices) {
     X(int, alpha_reg_warmup, 12000, "geometry", "advanced", "")              \
     X(int, reg_warmup_length, 0, "geometry", "advanced", "")                 \
     X(float, depth_supervision_weight, 0.0f, "geometry", "basic", "")        \
+    X(bool, lidar_only, false, "geometry", "expert", "")                    \
     X(std::string, lidar_scan, "", "geometry", "advanced", "<file>.las|.laz") \
     X(std::string, lidar_poses, "", "geometry", "advanced", "<file>.csv")    \
     X(float, lidar_weight, 0.25f, "geometry", "advanced", "")                 \
@@ -471,6 +472,7 @@ inline constexpr TrainPresetInfo kTrainPresets[] = {
     {"synthetic"},
     {"meshing"},
     {"2dgs"},
+    {"lidar"},
     // {"academic-baseline"},  // hidden by default, uncomment to enable
 };
 
@@ -567,6 +569,18 @@ inline bool train_apply_preset(TrainConfig& c, const std::string& name) {
         c.primitive = "2dgs";
         c.depth_distortion_reg = 0.1f;
         c.normal_reg_weight = 0.04f;
+        return true;
+    }
+    if (name == "lidar") {
+        c.lidar_only = true;
+        c.disable_viewer = true;
+        c.sh_degree = 0;
+        c.lidar_weight = 1.0f;
+        c.min_init_fraction = 0.0f;
+        c.use_bilateral_grid = false;
+        c.use_ppisp = false;
+        c.use_calib_warp = false;
+        c.calib_correction = "off";
         return true;
     }
     if (name == "academic-baseline") {

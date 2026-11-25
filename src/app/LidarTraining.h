@@ -1,5 +1,6 @@
 #pragma once
 
+#include "data/DatasetParser.h"
 #include "engine/Engine.h"
 #include <array>
 #include <string>
@@ -10,7 +11,7 @@ namespace app::lidar {
 class TrainingScan {
 public:
     TrainingScan(const std::string& scan, const std::string& poses,
-                 std::vector<double>* seed_xyz);
+                 ColmapPoints3D* seeds, bool matched_seeds = false);
     size_t frame_count() const { return frames_.size(); }
     size_t point_count() const { return point_count_; }
     bool sample(int step, const std::array<double, 3>& center, LidarTrainingView& view) const;

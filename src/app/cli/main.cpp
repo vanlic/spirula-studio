@@ -288,7 +288,9 @@ void select_and_print_devices(const std::string& requested, bool requested_set) 
 // `max_tier` is a rank into kTrainTiers: 0 lists only the flags a first run
 // needs (--help), kTrainNumTiers-1 lists every one of them (--help-all).
 void print_help(const char* argv0, const TrainConfig& c, int max_tier) {
-    std::printf("%s\n\n", format(cmsg::train_usage, {argv0}).c_str());
+    std::printf("%s\n", format(cmsg::train_usage, {argv0}).c_str());
+    std::printf("       %s lidar --lidar-scan <scan.las|.laz> --lidar-poses <frame.csv>\n\n",
+                argv0);
     std::printf("%s\n", cmsg::train_presets_header.get());
     static_assert(sizeof(kTrainPresets) / sizeof(kTrainPresets[0]) ==
                       spirula::i18n::msg::train::kNumPresetText,
@@ -500,7 +502,7 @@ int spirula_train_main(int argc, char** argv) {
         }
 
 #define SS_CHECK_REQUIRED(member)                                          \
-        if (cfg.member.empty())                                                \
+        if (!cfg.lidar_only && cfg.member.empty())                             \
             throw std::runtime_error("--" #member " is required");
         SS_CONFIG_REQUIRED_FIELDS(SS_CHECK_REQUIRED)
 #undef SS_CHECK_REQUIRED

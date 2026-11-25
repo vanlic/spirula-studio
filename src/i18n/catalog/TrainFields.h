@@ -4770,6 +4770,30 @@ SS_MSG(reg_warmup_length_help,
        "bırakır. Böylece geometri kısıtları çekiştirmeye başlamadan önce sahne "
        "biçimlenir."));
 
+SS_MSG(lidar_only,
+    EN("LiDAR-only training"), JA("LiDAR のみで学習"),
+    ZH_HANS("仅雷达训练"), ZH_HANT("僅雷達訓練"),
+    KO("LiDAR 전용 학습"), DE("Reines LiDAR-Training"),
+    FR("Entraînement LiDAR seul"), ES("Entrenamiento solo LiDAR"),
+    PT("Treinamento só com LiDAR"), IT("Addestramento solo LiDAR"),
+    NL("Alleen LiDAR trainen"), RU("Обучение только по LiDAR"),
+    TR("Yalnızca LiDAR eğitimi"));
+
+SS_MSG(lidar_only_help,
+    EN("Train geometry from a timed scan and its trajectory."),
+    JA("時刻付きスキャンと軌跡から形状を学習します。"),
+    ZH_HANS("用带时间戳的点云和轨迹训练几何。"),
+    ZH_HANT("用帶時間戳的點雲和軌跡訓練幾何。"),
+    KO("시간 정보가 있는 스캔과 궤적으로 형상을 학습합니다."),
+    DE("Geometrie aus einem Scan mit Zeitstempeln und seiner Trajektorie lernen."),
+    FR("Apprend la géométrie avec un scan horodaté et sa trajectoire."),
+    ES("Entrena la geometría con un escaneo con tiempos y su trayectoria."),
+    PT("Treina a geometria com uma varredura com tempos e sua trajetória."),
+    IT("Addestra la geometria con una scansione con tempi e la sua traiettoria."),
+    NL("Train geometrie met een scan met tijdstempels en zijn traject."),
+    RU("Обучает геометрию по скану с метками времени и его траектории."),
+    TR("Geometriyi zaman damgalı tarama ve yörüngesiyle eğitir."));
+
 SS_MSG(lidar_scan,
     EN("Timed LiDAR scan"),
     JA("時刻付き LiDAR スキャン"),
@@ -4816,10 +4840,10 @@ SS_MSG(lidar_poses,
     TR("LiDAR yörüngesi"));
 
 SS_MSG(lidar_poses_help,
-    EN("CSV with time_sec, x, y, z for the laser origins."),
+    EN("Use frame.csv or frames.csv with time_sec, x, y, z."),
     JA("レーザー原点を time_sec, x, y, z で記録した CSV。"),
-    ZH_HANS("记录激光原点的 CSV，包含 time_sec、x、y、z。"),
-    ZH_HANT("記錄雷射原點的 CSV，包含 time_sec、x、y、z。"),
+    ZH_HANS("选择含 time_sec、x、y、z 的 frame.csv 或 frames.csv。"),
+    ZH_HANT("選擇含 time_sec、x、y、z 的 frame.csv 或 frames.csv。"),
     KO("레이저 원점의 time_sec, x, y, z가 있는 CSV입니다."),
     DE("CSV mit time_sec, x, y, z der Laserpositionen."),
     FR("CSV avec time_sec, x, y, z pour les origines laser."),

@@ -1,6 +1,7 @@
 // ViewportPanel.cpp -- see ViewportPanel.h.
 
 #include "app/gui/ViewportPanel.h"
+#include "app/gui/SceneFrame.h"
 #include "app/gui/ViewBookmarks.h"
 #include "data/FrustumTemplate.h"
 
@@ -168,11 +169,20 @@ void ViewportPanel::center_shared(float out[3]) const {
 }
 
 void ViewportPanel::compute_framing(const spirula::TrainerSession& session) {
-    reset_pose(1.0f);
-
-    // Scene radius (drives only the preview depth range): spread of the
-    // camera positions in the client frame.
     const auto& ds = session.ds;
+    if (ds.num_cameras == 0 && ds.points.num() > 0) {
+        float center[3], radius;
+        scene_extent(ds.points.xyz, ds.points.num(), center, radius);
+        const float distance = view_distance_for(radius);
+        reset_pose(distance);
+        for (int i = 0; i < 3; ++i)
+            _cam.pos[i] = _cam.target[i] + distance * (_cam.pos[i] - _cam.target[i]);
+        _home = _cam;
+        return;
+    }
+
+    reset_pose(1.0f);
+    // The preview depth range uses the spread of cameras in the client frame.
     double A[16];
     dsparse::train_to_normalized_inverse(ds, A);
     double radius = 1.0;
@@ -188,7 +198,8 @@ void ViewportPanel::compute_framing(const spirula::TrainerSession& session) {
 }
 
 bool ViewportPanel::maybe_frame(const spirula::TrainerSession& session) {
-    std::string key = session.cfg.data + ":" +
+    const std::string& input = session.cfg.lidar_only ? session.cfg.lidar_scan : session.cfg.data;
+    std::string key = input + ":" +
         std::to_string(session.ds.num_cameras) + ":" +
         std::to_string(session.ds.points.num());
     const bool first = key != _framed_key;

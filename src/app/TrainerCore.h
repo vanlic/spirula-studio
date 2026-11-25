@@ -347,6 +347,7 @@ public:
     void log(const std::string& msg);
 
 private:
+    void load_lidar_scan();
     // ds.points drawn at random when --random-init asks for it.
     void seed_at_random();
     void set_downscale_cache(DataManagerConfig& dm) const;

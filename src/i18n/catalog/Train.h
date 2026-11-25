@@ -376,6 +376,38 @@ SS_MSG(preset_academic_baseline_help,
 // consumer static_asserts that the two lists are the same length.
 // ---------------------------------------------------------------------------
 
+SS_MSG(preset_lidar,
+    EN("LiDAR training"), JA("LiDAR トレーニング"),
+    ZH_HANS("激光雷达训练"), ZH_HANT("雷射雷達訓練"),
+    KO("LiDAR 학습"), DE("LiDAR-Training"),
+    FR("Entraînement LiDAR"), ES("Entrenamiento LiDAR"),
+    PT("Treinamento LiDAR"), IT("Addestramento LiDAR"),
+    NL("LiDAR-training"), RU("Обучение по LiDAR"), TR("LiDAR eğitimi"));
+
+SS_MSG(preset_lidar_help,
+    EN("Train from a timed LAS/LAZ scan and its trajectory CSV."),
+    JA("時刻付き LAS/LAZ と軌跡 CSV からトレーニングします。"),
+    ZH_HANS("用带时间戳的 LAS/LAZ 点云和位姿 CSV 训练。"),
+    ZH_HANT("用帶時間戳的 LAS/LAZ 點雲和位姿 CSV 訓練。"),
+    KO("시간 정보가 있는 LAS/LAZ와 궤적 CSV로 학습합니다."),
+    DE("Aus LAS/LAZ mit Zeitstempeln und Trajektorien-CSV trainieren."),
+    FR("Entraîne avec un LAS/LAZ horodaté et son CSV de trajectoire."),
+    ES("Entrena con un LAS/LAZ con marcas de tiempo y su CSV de trayectoria."),
+    PT("Treina com um LAS/LAZ com tempos e seu CSV de trajetória."),
+    IT("Addestra da LAS/LAZ con tempi e dal CSV della traiettoria."),
+    NL("Train met een LAS/LAZ met tijdstempels en bijbehorende traject-CSV."),
+    RU("Обучение по LAS/LAZ с метками времени и CSV траектории."),
+    TR("Zaman damgalı LAS/LAZ ve yörünge CSV dosyasıyla eğitir."));
+
+SS_MSG(lidar_depth_metric,
+    EN("LiDAR depth loss {0}"), JA("LiDAR 深度損失 {0}"),
+    ZH_HANS("雷达深度损失 {0}"), ZH_HANT("雷達深度損失 {0}"),
+    KO("LiDAR 깊이 손실 {0}"), DE("LiDAR-Tiefenverlust {0}"),
+    FR("Perte de profondeur LiDAR {0}"), ES("Pérdida de profundidad LiDAR {0}"),
+    PT("Perda de profundidade LiDAR {0}"), IT("Perdita di profondità LiDAR {0}"),
+    NL("LiDAR-diepteverlies {0}"), RU("Потери глубины LiDAR {0}"),
+    TR("LiDAR derinlik kaybı {0}"));
+
 struct PresetText {
     const char* name;
     const Msg* label;
@@ -391,6 +423,7 @@ inline constexpr PresetText kPresetText[] = {
     {"synthetic",         &preset_synthetic,         &preset_synthetic_help},
     {"meshing",           &preset_meshing,           &preset_meshing_help},
     {"2dgs",              &preset_2dgs,              &preset_2dgs_help},
+    {"lidar",             &preset_lidar,             &preset_lidar_help},
     // hidden by default, uncomment to enable
    //  {"academic-baseline", &preset_academic_baseline, &preset_academic_baseline_help},
 };

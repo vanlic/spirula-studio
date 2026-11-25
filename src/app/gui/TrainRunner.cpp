@@ -155,6 +155,12 @@ void TrainRunner::load_dataset(const TrainConfig& cfg, const std::string& preset
     {
         std::lock_guard<std::mutex> lk(_mu);
         _error.clear();
+        _metrics.clear();
+    }
+    if (cfg.lidar_only || cfg.data.empty()) {
+        _session.reset();
+        _phase = Phase::Idle;
+        return;
     }
     _session.reset(new TrainerSession());
     _session->cfg = cfg;
@@ -246,6 +252,7 @@ void TrainRunner::start_training(const TrainConfig& cfg, const std::string& pres
                 m.psnr = get("psnr");
                 m.ssim = get("ssim");
                 m.rgb_loss = get("rgb_loss");
+                m.lidar_depth_loss = get("lidar_depth_loss");
                 m.num_splats = (float)p.num_splats;
                 _metrics.push_back(m);
             };

@@ -866,6 +866,7 @@ bool GuiApp::training_busy() const {
 
 void GuiApp::apply_preset(const std::string& preset) {
     if (native_work_busy() || _batch_active) return;
+    const bool was_lidar = _cfg.lidar_only;
     TrainConfig fresh;
     train_apply_preset(fresh, preset);
     // Keep GUI-managed context across preset switches.
@@ -875,6 +876,13 @@ void GuiApp::apply_preset(const std::string& preset) {
     fresh.output_dir_prefix = _cfg.output_dir_prefix;
     fresh.output_dir_name = _cfg.output_dir_name;
     fresh.roi_region = _cfg.roi_region;
+    if (fresh.lidar_only) {
+        fresh.roi_region = "off";
+        if (was_lidar) {
+            fresh.lidar_scan = _cfg.lidar_scan;
+            fresh.lidar_poses = _cfg.lidar_poses;
+        }
+    }
     // The native viewport replaces the web viewer by default; it can be
     // re-enabled in Basic Options for remote monitoring.
     fresh.disable_viewer = true;
@@ -889,7 +897,7 @@ void GuiApp::apply_preset(const std::string& preset) {
     fresh.finish_command = _cfg.finish_command;
     _cfg = fresh;
     _cfg_ui.touched.clear();
-    if (!_cfg.data.empty()) {
+    if (was_lidar || _cfg.lidar_only || !_cfg.data.empty()) {
         detach_session_views();
         _runner.load_dataset(_cfg, _preset);
     }
@@ -900,13 +908,21 @@ void GuiApp::apply_preset(const std::string& preset) {
 // (SS_PRESET_CONTEXT_FIELDS), because a preset is "how", not "where".
 void GuiApp::apply_user_preset(const TrainPreset& p) {
     if (native_work_busy() || _batch_active) return;
+    const bool was_lidar = _cfg.lidar_only;
     const TrainConfig stock;
     TrainConfig fresh = p.cfg;
     fresh.data = _cfg.data;
-    fresh.resume = _cfg.resume;
+    fresh.resume = p.cfg.lidar_only == _cfg.lidar_only ? _cfg.resume : std::string();
     fresh.output_dir_prefix = _cfg.output_dir_prefix;
     fresh.output_dir_name = _cfg.output_dir_name;
     fresh.roi_region = _cfg.roi_region;
+    if (fresh.lidar_only) {
+        fresh.roi_region = "off";
+        if (_cfg.lidar_only) {
+            fresh.lidar_scan = _cfg.lidar_scan;
+            fresh.lidar_poses = _cfg.lidar_poses;
+        }
+    }
     // The image and mask folders are ordinary dataset options and travel with
     // a preset, but a preset that never moved them must not move them here:
     // the handoff out of a reconstruction points them at folders that only
@@ -927,7 +943,7 @@ void GuiApp::apply_user_preset(const TrainPreset& p) {
     // What the preset spelled out is off limits to the macro options, exactly
     // as if the user had just typed it (train_resolve_macros).
     _cfg_ui.touched = p.touched;
-    if (!_cfg.data.empty()) {
+    if (was_lidar || _cfg.lidar_only || !_cfg.data.empty()) {
         detach_session_views();
         _runner.load_dataset(_cfg, _preset);
     }
@@ -1167,6 +1183,10 @@ void GuiApp::open_dataset(std::string dir, std::string image_dir,
                           std::string mask_dir, bool mask_flipped,
                           bool keep_log, std::string seed) {
     if (dir.empty() || native_work_busy()) return;
+    if (_cfg.lidar_only) {
+        _cfg.data.clear();
+        apply_preset("3dgs");
+    }
     app::set_crash_note("opening dataset " + dir);
     close_native_previews();
     close_mesh_preview();
@@ -1413,7 +1433,8 @@ void GuiApp::stop_inference_users() {
 }
 
 void GuiApp::launch_training(const TrainConfig& cfg, const std::string& preset) {
-    if (cfg.data.empty() || native_work_busy()) return;
+    if (native_work_busy()) return;
+    if (cfg.lidar_only ? cfg.lidar_scan.empty() || cfg.lidar_poses.empty() : cfg.data.empty()) return;
     stop_inference_users();
     close_splat();
 #ifdef SS_BACKEND_VULKAN
@@ -1421,11 +1442,12 @@ void GuiApp::launch_training(const TrainConfig& cfg, const std::string& preset) 
 #else
     if (!freeze_cuda_device()) return;
 #endif
-    app::set_crash_note("training " + cfg.data);
+    app::set_crash_note("training " + (cfg.lidar_only ? cfg.lidar_scan : cfg.data));
     close_mesh_preview();
     detach_session_views();
-    std::string data_dir = cfg.data;
-    if (fs::path(data_dir).filename() == "images")
+    std::string data_dir = cfg.lidar_only
+        ? fs::absolute(fs::u8path(cfg.lidar_scan)).parent_path().u8string() : cfg.data;
+    if (!cfg.lidar_only && fs::path(data_dir).filename() == "images")
         data_dir = fs::path(data_dir).parent_path().string();
     open_run_log(_train_log, data_dir, "train", run_log_stamp());
     set_ss_env("UNREG_LOG", "");
@@ -3649,7 +3671,7 @@ void GuiApp::frame() {
     if (_parse_dirty && !native_work_busy() && !_batch_active &&
         !ImGui::IsAnyItemActive()) {
         _parse_dirty = false;
-        if (!_cfg.data.empty()) {
+        if (!_cfg.lidar_only && !_cfg.data.empty()) {
             log(dmsg::log_dataset_settings_changed.get());
             detach_session_views();
             _runner.load_dataset(_cfg, _preset);
@@ -3669,7 +3691,7 @@ void GuiApp::frame() {
         }
         // The photograph-vs-render mode needs the DataManager as well as the
         // splats, so it waits for engine setup exactly as the viewport does.
-        if (!_images.attached() && _runner.session())
+        if (!_images.attached() && _runner.session() && !_runner.session()->cfg.lidar_only)
             _images.attach(*_runner.session());
     } else if (_runner.phase() == TrainRunner::Phase::Ready) {
         if (!_viewport.preview_active() && _runner.session()) {
@@ -4115,6 +4137,14 @@ void GuiApp::draw_home() {
                   FileDialog::Mode::Folder);
     }
     ui::help_on_hover(msg::home_open_dataset_help);
+    ImGui::BeginDisabled(native_work_busy() || _batch_active);
+    if (ui::Button(tmsg::preset_lidar, ImVec2(-1, bh))) {
+        if (!_cfg.lidar_only) apply_preset("lidar");
+        _show_settings = true;
+        _screen = Screen::Train;
+    }
+    ImGui::EndDisabled();
+    ui::help_on_hover_disabled(tmsg::preset_lidar_help);
     // Only runs saved with full checkpoints can resume; File menu still has it.
     if (_keep_full_ckpt) {
         ImGui::BeginDisabled(native_work_busy() || training_busy());
@@ -9504,6 +9534,8 @@ void GuiApp::draw_train() {
         ImGui::SameLine();
         const BatchRow* row = batch_running_row();
         ui::TextDisabledRaw(row ? row->dataset : std::string());
+    } else if (_cfg.lidar_only) {
+        ui::TextDisabledRaw(_cfg.lidar_scan);
     } else {
         ui::TextDisabledRaw(_cfg.data);
         // Offered when the dataset's mask folder exists; probed at most once
@@ -9537,13 +9569,15 @@ void GuiApp::draw_train() {
     {
         const float w = px(160.0f);
         draw_screenshot_controls(w);
-        ImGui::SameLine(std::max(0.0f, ImGui::GetContentRegionMax().x - w));
-        ImGui::SetNextItemWidth(w);
-        int mode = _preview_images ? 1 : 0;
-        if (ui::ComboRaw("##previewmode", &mode,
-                         {&msg::preview_mode_3d, &msg::preview_mode_images}))
-            _preview_images = mode == 1;
-        ui::help_on_hover(msg::preview_mode_help);
+        if (!_cfg.lidar_only) {
+            ImGui::SameLine(std::max(0.0f, ImGui::GetContentRegionMax().x - w));
+            ImGui::SetNextItemWidth(w);
+            int mode = _preview_images ? 1 : 0;
+            if (ui::ComboRaw("##previewmode", &mode,
+                             {&msg::preview_mode_3d, &msg::preview_mode_images}))
+                _preview_images = mode == 1;
+            ui::help_on_hover(msg::preview_mode_help);
+        }
     }
 
     draw_device_issue_banner();
@@ -9578,7 +9612,7 @@ void GuiApp::draw_train() {
     // The step both previews pace their refresh by while nobody is steering.
     const int step = stepping ? _runner.latest_progress().step : -1;
     // The images view's textures are ~0.7 GB at 60 MP; hidden, training can have them.
-    if (_preview_images) _images.draw(stepping, step);
+    if (_preview_images && !_cfg.lidar_only) _images.draw(stepping, step);
     else                 { _images.destroy_gl(); _viewport.draw(stepping, step); }
     ImGui::EndChild();
     draw_status_strip();
@@ -11121,6 +11155,7 @@ bool GuiApp::draw_batch_train_preset(BatchPreset& p, const char* id, int row,
 
     ui::SeparatorText(msg::preset_builtin_group);
     for (const auto& b : kTrainPresets) {
+        if (std::string_view(b.name) == "lidar") continue;
         const bool sel = p.path.empty() && p.name == b.name;
         if (ui::SelectableRaw(preset_label(b.name), sel)) {
             p.path.clear();
@@ -11134,6 +11169,7 @@ bool GuiApp::draw_batch_train_preset(BatchPreset& p, const char* id, int row,
     ui::SeparatorText(msg::preset_user_group);
     if (_train_presets.items.empty()) ui::TextDisabled(msg::preset_none_saved);
     for (const auto& t : _train_presets.items) {
+        if (t.cfg.lidar_only) continue;
         ImGui::PushID(t.path.c_str());
         const bool sel = p.path == t.path;
         if (ui::SelectableRaw(t.name, sel)) {
@@ -11460,39 +11496,41 @@ void GuiApp::draw_train_settings() {
                 ph == TrainRunner::Phase::Evaluating;
 
     // ---- dataset ----
-    ui::SeparatorText(msg::section_dataset);
-    switch (ph) {
-        case TrainRunner::Phase::Loading:
-            ui::TextColored(kDim, msg::parsing_dataset);
-            break;
-        case TrainRunner::Phase::LoadError:
-            // Parser errors name files and formats; they stay English so that
-            // searching for one finds the same text everyone else saw.
-            ui::TextColoredWrappedRaw(kErr, _runner.error());
-            break;
-        default:
-            if (auto* s = _runner.session()) {
-                if (ph == TrainRunner::Phase::Ready ||
-                    ph == TrainRunner::Phase::Training ||
-                    ph == TrainRunner::Phase::Evaluating ||
-                    ph == TrainRunner::Phase::Done) {
-                    ui::Text(msg::dataset_summary,
-                             {(long long)s->ds.num_cameras,
-                              (long long)s->post.n_post,
-                              format_count((double)s->ds.points.num())});
+    if (!_cfg.lidar_only) {
+        ui::SeparatorText(msg::section_dataset);
+        switch (ph) {
+            case TrainRunner::Phase::Loading:
+                ui::TextColored(kDim, msg::parsing_dataset);
+                break;
+            case TrainRunner::Phase::LoadError:
+                // Parser errors name files and formats; they stay English so that
+                // searching for one finds the same text everyone else saw.
+                ui::TextColoredWrappedRaw(kErr, _runner.error());
+                break;
+            default:
+                if (auto* s = _runner.session()) {
+                    if (ph == TrainRunner::Phase::Ready ||
+                        ph == TrainRunner::Phase::Training ||
+                        ph == TrainRunner::Phase::Evaluating ||
+                        ph == TrainRunner::Phase::Done) {
+                        ui::Text(msg::dataset_summary,
+                                 {(long long)s->ds.num_cameras,
+                                  (long long)s->post.n_post,
+                                  format_count((double)s->ds.points.num())});
+                    }
+                } else {
+                    ui::TextColored(kDim, msg::no_dataset_loaded);
                 }
-            } else {
-                ui::TextColored(kDim, msg::no_dataset_loaded);
-            }
-            break;
+                break;
+        }
+        ImGui::BeginDisabled(busy && ph != TrainRunner::Phase::Loading);
+        if (ui::Button(msg::change_dataset)) {
+            open_pick(PickAction::OpenDataset, msg::menu_open_dataset.get(),
+                      FileDialog::Mode::Folder);
+        }
+        ImGui::EndDisabled();
+        if (!_batch_active) draw_roi_row(busy);
     }
-    ImGui::BeginDisabled(busy && ph != TrainRunner::Phase::Loading);
-    if (ui::Button(msg::change_dataset)) {
-        open_pick(PickAction::OpenDataset, msg::menu_open_dataset.get(),
-                  FileDialog::Mode::Folder);
-    }
-    ImGui::EndDisabled();
-    if (!_batch_active) draw_roi_row(busy);
 
     // Vulkan builds share the native picker with every built-in workflow.
 #ifdef SS_BACKEND_VULKAN
@@ -11545,14 +11583,35 @@ void GuiApp::draw_train_settings() {
         // A preset reloads the dataset itself; against the old snapshot the
         // preset's own values would look like an edit and load it again.
         if (draw_preset_picker()) parse_before = _cfg;
+        if (_cfg.lidar_only) {
+            const auto path_row = [&](const char* field, const Msg& label, const Msg& help,
+                                      std::string& value, std::vector<std::string> extensions) {
+                ImGui::PushID(field);
+                ui::Text(label);
+                ImGui::SetNextItemWidth(-ImGui::GetFrameHeightWithSpacing());
+                const std::string input_id = std::string("###") + field;
+                ui::InputTextRaw(input_id.c_str(), &value);
+                ImGui::SameLine();
+                if (ui::ButtonRaw("...")) {
+                    _pick_field = field;
+                    const auto start = fs::u8path(value).parent_path().u8string();
+                    open_pick(PickAction::ConfigPath, label.get(), FileDialog::Mode::File,
+                              std::move(extensions), start);
+                }
+                ui::help_on_hover(help);
+                ImGui::PopID();
+            };
+            path_row("lidar_scan", fld::lidar_scan, fld::lidar_scan_help, _cfg.lidar_scan, {".las", ".laz"});
+            path_row("lidar_poses", fld::lidar_poses, fld::lidar_poses_help, _cfg.lidar_poses, {".csv"});
+        }
 
         ui::SeparatorText(msg::section_basic_options);
         draw_basic_options();
 
         // Without a dense cloud the only choice is the dataset's own points,
         // so the section stays out of the way; Advanced still has the flag.
-        if (dense_cloud_present() ||
-            (!_cfg.seed_pointcloud.empty() && _cfg.seed_pointcloud != spirula::dense::kSparseSeed))
+        if (!_cfg.lidar_only && (dense_cloud_present() ||
+            (!_cfg.seed_pointcloud.empty() && _cfg.seed_pointcloud != spirula::dense::kSparseSeed)))
             draw_seed_cloud(ph);
 
         ImGui::Spacing();
@@ -12319,11 +12378,12 @@ void GuiApp::draw_basic_options() {
         _cfg_ui.touched.insert("output_dir_name");
     ui::help_on_hover(msg::opt_run_name_help);
     {
+        const auto input = fs::u8path(_cfg.lidar_only ? _cfg.lidar_scan : _cfg.data);
         std::string run = _cfg.output_dir_name.empty()
-            ? fs::path(_cfg.data).stem().string() + "_<time>"
+            ? input.stem().u8string() + "_<time>"
             : _cfg.output_dir_name;
         ui::TextColoredWrappedRaw(
-            kDim, "-> " + (fs::path(_cfg.output_dir_prefix) / run).string());
+            kDim, "-> " + (fs::u8path(_cfg.output_dir_prefix) / fs::u8path(run)).u8string());
     }
     ImGui::Spacing();
 
@@ -12491,10 +12551,11 @@ void GuiApp::draw_train_controls() {
             }
             // A batch owns the runner between its tasks, so the queue's own
             // next row is what starts -- never a click here.
-            bool can_start = !_batch_active && !native_work_busy() &&
-                             (ph == TrainRunner::Phase::Ready ||
-                              ph == TrainRunner::Phase::Done ||
-                              ph == TrainRunner::Phase::TrainError);
+            const bool ready = _cfg.lidar_only
+                ? !_cfg.lidar_scan.empty() && !_cfg.lidar_poses.empty()
+                : ph == TrainRunner::Phase::Ready || ph == TrainRunner::Phase::Done ||
+                  ph == TrainRunner::Phase::TrainError;
+            bool can_start = !_batch_active && !native_work_busy() && ready;
             ImGui::BeginDisabled(!can_start);
             if (ui::Button(ph == TrainRunner::Phase::Done ? msg::train_again
                                                           : msg::start_training,
@@ -12576,6 +12637,13 @@ void GuiApp::draw_metrics() {
     static std::vector<TrainRunner::MetricPoint> pts;
     _runner.get_metrics(pts);
     if (pts.empty()) return;
+    if (const auto* session = _runner.session(); session && session->cfg.lidar_only) {
+        ui::SeparatorText(msg::section_metrics);
+        char loss[32];
+        std::snprintf(loss, sizeof loss, "%.6g", pts.back().lidar_depth_loss);
+        ui::Text(tmsg::lidar_depth_metric, {loss});
+        return;
+    }
 
     ui::SeparatorText(msg::section_metrics);
     int stride = std::max<size_t>(1, pts.size() / 240);
@@ -13128,6 +13196,13 @@ void GuiApp::open_resume(const std::string& path) {
     cfg.disable_viewer = true;   // as apply_preset: the native viewport
     _preset = preset;
     _cfg = cfg;
+    if (cfg.lidar_only) {
+        detach_session_views();
+        _runner.load_dataset(_cfg, _preset);
+        _show_settings = true;
+        _screen = Screen::Train;
+        return;
+    }
     open_dataset(cfg.data, cfg.image_dir, cfg.mask_dir, cfg.flip_mask);
     // open_dataset re-defaults the output beside the dataset; a resume writes into its own run.
     _cfg.output_dir_prefix = cfg.output_dir_prefix;

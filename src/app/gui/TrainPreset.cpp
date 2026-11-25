@@ -36,6 +36,10 @@ void clear_context(TrainConfig& c) {
 #define SS_PRESET_CLEAR(member) c.member = stock.member;
     SS_PRESET_CONTEXT_FIELDS(SS_PRESET_CLEAR)
 #undef SS_PRESET_CLEAR
+    if (c.lidar_only) {
+        c.lidar_scan.clear();
+        c.lidar_poses.clear();
+    }
 }
 
 }  // namespace

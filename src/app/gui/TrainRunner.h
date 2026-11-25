@@ -44,6 +44,7 @@ public:
     struct MetricPoint {
         int step = 0;
         float psnr = 0, ssim = 0, rgb_loss = 0;
+        float lidar_depth_loss = 0;
         float num_splats = 0;
     };
 

@@ -184,6 +184,7 @@ private:
 // thumbnails. Call after engine_setup_data_manager, before rendering with
 // show_cams. Returns the frustum size, for ViewerRenderConfig::base_camera_size.
 float viewer_upload_cameras(const PostSplitCameras& post);
+void viewer_upload_placeholder_camera(const float center[3], float size);
 
 // The frustum size alone (camhost::frustum_display_size in the training
 // frame), for renderers that draw frusta without the engine.

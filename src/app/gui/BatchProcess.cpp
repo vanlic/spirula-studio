@@ -14,6 +14,7 @@
 #include "data/RoiDocument.h"
 #include "i18n/catalog/Gui.h"
 #include "i18n/catalog/Log.h"
+#include "i18n/catalog/Train.h"
 
 #include <algorithm>
 #include <cctype>
@@ -550,6 +551,11 @@ void check_train_stage(const BatchRow& row, const BatchCapabilities& caps,
             out.push_back(issue_of(p.path.empty() ? msg::chk_preset_unknown
                                                   : msg::chk_preset_unreadable,
                                    kSt, true, p.path.empty() ? p.name : p.path));
+            continue;
+        }
+        if (cfg.lidar_only) {
+            out.push_back(issue_of(msg::chk_unsupported, kSt, true,
+                                   spirula::i18n::msg::train::preset_lidar.get()));
             continue;
         }
         // Everything the trainer refuses outright, asked before the queue has

@@ -14,16 +14,28 @@
 namespace app::lidar {
 namespace {
 
+constexpr float kMinDepth = 0.1f;
+
 struct Pose {
     double time;
     std::array<double, 3> origin;
 };
 
-std::vector<std::string> columns(std::string line) {
-    if (!line.empty() && line.back() == '\r') line.pop_back();
+std::string trim(const std::string& value) {
+    const auto first = value.find_first_not_of(" \t\r");
+    if (first == std::string::npos) return {};
+    return value.substr(first, value.find_last_not_of(" \t\r") - first + 1);
+}
+
+std::vector<std::string> columns(const std::string& line) {
     std::istringstream stream(line);
     std::vector<std::string> fields;
-    for (std::string field; std::getline(stream, field, ',');) fields.push_back(std::move(field));
+    for (std::string field; std::getline(stream, field, ',');) {
+        field = trim(field);
+        if (field.size() >= 2 && field.front() == '"' && field.back() == '"')
+            field = trim(field.substr(1, field.size() - 2));
+        fields.push_back(std::move(field));
+    }
     return fields;
 }
 
@@ -32,6 +44,8 @@ std::vector<Pose> read_poses(const std::string& path) {
     std::string line;
     if (!std::getline(file, line)) throw std::runtime_error("Cannot read LiDAR trajectory: " + path);
     if (line.compare(0, 3, "\xef\xbb\xbf") == 0) line.erase(0, 3);
+    size_t row = 1;
+    while ((trim(line).empty() || trim(line).front() == '#') && std::getline(file, line)) ++row;
     const auto header = columns(line);
     std::array<size_t, 4> indices{};
     const char* names[] = {"time_sec", "x", "y", "z"};
@@ -42,28 +56,37 @@ std::vector<Pose> read_poses(const std::string& path) {
     }
     std::vector<Pose> poses;
     while (std::getline(file, line)) {
-        if (line.empty() || line == "\r") continue;
+        ++row;
+        line = trim(line);
+        if (line.empty() || line.front() == '#') continue;
         const auto fields = columns(line);
         double value[4];
-        for (size_t i = 0; i < indices.size(); ++i) {
-            size_t end = 0;
-            const auto& field = fields.at(indices[i]);
-            value[i] = std::stod(field, &end);
-            if (end != field.size() || !std::isfinite(value[i]))
-                throw std::runtime_error("Invalid number in LiDAR trajectory: " + path);
+        try {
+            for (size_t i = 0; i < indices.size(); ++i) {
+                size_t end = 0;
+                const auto& field = fields.at(indices[i]);
+                value[i] = std::stod(field, &end);
+                if (end != field.size() || !std::isfinite(value[i]))
+                    throw std::invalid_argument(names[i]);
+            }
+        } catch (const std::logic_error&) {
+            throw std::runtime_error("Invalid time or position in LiDAR trajectory: " +
+                                     path + ":" + std::to_string(row));
         }
-        if (!poses.empty() && value[0] <= poses.back().time)
-            throw std::runtime_error("LiDAR trajectory times must be strictly increasing");
         poses.push_back({value[0], {value[1], value[2], value[3]}});
     }
-    if (poses.size() < 2) throw std::runtime_error("LiDAR trajectory needs at least two positions");
+    std::stable_sort(poses.begin(), poses.end(),
+                     [](const Pose& a, const Pose& b) { return a.time < b.time; });
+    poses.erase(std::unique(poses.begin(), poses.end(),
+                            [](const Pose& a, const Pose& b) { return a.time == b.time; }), poses.end());
+    if (poses.size() < 2) throw std::runtime_error("LiDAR trajectory needs two distinct timestamps");
     return poses;
 }
 
 }  // namespace
 
 TrainingScan::TrainingScan(const std::string& scan, const std::string& trajectory,
-                           std::vector<double>* seed_xyz) {
+                           ColmapPoints3D* seeds, bool matched_seeds) {
     const std::vector<Pose> poses = read_poses(trajectory);
     spirula::cloud::Reader reader(scan);
     if (reader.info().format != spirula::cloud::Format::Las)
@@ -89,25 +112,38 @@ TrainingScan::TrainingScan(const std::string& scan, const std::string& trajector
     }
     std::mt19937 rng(42);
     std::bernoulli_distribution seed(0.03);
+    const auto add_seed = [&](const spirula::e57::Point& p) {
+        seeds->xyz.insert(seeds->xyz.end(), p.xyz, p.xyz + 3);
+        if (matched_seeds && reader.info().has_color)
+            seeds->rgb.insert(seeds->rgb.end(), p.rgb, p.rgb + 3);
+        else
+            seeds->rgb.insert(seeds->rgb.end(), 3, uint8_t(128));
+    };
+    spirula::e57::Point first_return{};
     size_t index = 0;
     reader.read([&](const spirula::e57::Point* points, size_t count) {
         for (size_t i = 0; i < count; ++i, ++index) {
             const auto& p = points[i];
             if (!std::isfinite(p.xyz[0]) || !std::isfinite(p.xyz[1]) || !std::isfinite(p.xyz[2])) continue;
-            if (seed_xyz && seed(rng)) seed_xyz->insert(seed_xyz->end(), p.xyz, p.xyz + 3);
-            if (index % 4 || !std::isfinite(p.gps_time) || p.gps_time < first || p.gps_time > last) continue;
+            if (seeds && !matched_seeds && seed(rng)) add_seed(p);
+            if (!std::isfinite(p.gps_time) || p.gps_time < first || p.gps_time > last) continue;
             const size_t frame = std::min(frames_.size() - 1, size_t((p.gps_time - first) / frame_seconds));
             auto& target = frames_[frame];
             if (!target.valid) continue;
-            target.points.push_back({float(p.xyz[0] - target.origin[0]),
-                                     float(p.xyz[1] - target.origin[1]),
-                                     float(p.xyz[2] - target.origin[2])});
+            const sfm::Vec3 delta{p.xyz[0] - target.origin[0], p.xyz[1] - target.origin[1],
+                                  p.xyz[2] - target.origin[2]};
+            if (delta.dot(delta) < kMinDepth * kMinDepth) continue;
+            if (seeds && matched_seeds && seed(rng)) add_seed(p);
+            if (index % 4 && !target.points.empty()) continue;
+            if (point_count_ == 0) first_return = p;
+            target.points.push_back({float(delta.x), float(delta.y), float(delta.z)});
             ++point_count_;
         }
     });
     frames_.erase(std::remove_if(frames_.begin(), frames_.end(),
                                 [](const Frame& f) { return f.points.empty(); }), frames_.end());
     if (frames_.empty()) throw std::runtime_error("No scan point times overlap the LiDAR trajectory");
+    if (seeds && matched_seeds && seeds->num() == 0) add_seed(first_return);
 }
 
 bool TrainingScan::sample(int step, const std::array<double, 3>& center, LidarTrainingView& view) const {
@@ -131,7 +167,7 @@ bool TrainingScan::sample(int step, const std::array<double, 3>& center, LidarTr
     for (const auto& pt : frame.points) {
         const sfm::Vec3 delta{pt[0], pt[1], pt[2]};
         const double z = forward.dot(delta);
-        if (z < 0.1) continue;
+        if (z < kMinDepth) continue;
         const double x = view.focal * right.dot(delta) / z + view.size * 0.5;
         const double y = view.focal * down.dot(delta) / z + view.size * 0.5;
         if (x >= 0 && y >= 0 && x < view.size && y < view.size)
