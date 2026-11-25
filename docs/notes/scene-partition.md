@@ -31,8 +31,11 @@ CPU estimate uses Spirula's camera models and point-cloud rasterization.
 The largest block is split first. Each axis is ranked by its weighted
 5th-to-95th percentile span. The splitter tests up to 150, 100 and 50
 quantiles on those axes, scoring both expanded children against the parent
-and the budget. It stops when every block fits `--gpixels`, or fails if an
-over-budget block cannot be split. `--voxel-size` sets the voxel width in
+and the budget. If no cut passes the scoring threshold, it retries with
+smaller padding, then checks every voxel gap with zero padding. A block that
+can fit by cutting its padding alone may keep its existing core. Every output
+block must fit `--gpixels`. If one voxel alone exceeds the budget, the error
+reports its load and the voxel size. `--voxel-size` sets the voxel width in
 dataset units (0 uses 1/256 of the longest scene extent). `--overlap` sets
 the maximum padding per side in the same units (0 uses adaptive padding).
 Padding starts from the greater of three voxels and 5% of the dominant

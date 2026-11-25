@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -256,7 +257,7 @@ int run_merge(int argc, char** argv) {
 
 }  // namespace
 
-int spirula_partition_main(int argc, char** argv) {
+int spirula_partition_main(int argc, char** argv) try {
     app::set_program_name(argc > 0 ? argv[0] : nullptr, "spirula partition");
     if (argc < 2) {
         usage();
@@ -272,4 +273,7 @@ int spirula_partition_main(int argc, char** argv) {
     if (fs::is_directory(verb, ec)) return run_split(argc, argv);
     std::fprintf(stderr, "%s\n", format(P::err_usage, {app::program_name()}).c_str());
     return 2;
+} catch (const std::exception& e) {
+    std::fprintf(stderr, "%s\n", e.what());
+    return 1;
 }

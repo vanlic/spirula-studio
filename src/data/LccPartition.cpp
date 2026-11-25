@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -162,41 +163,78 @@ bool split_block(const SpatialPart& parent, const std::vector<Voxel>& voxels, do
     }
     std::stable_sort(axes.begin(), axes.end(), [&](int a, int b) { return span[a] > span[b]; });
     double overlap = std::min(overlap_limit, std::max(span[axes.front()] * 0.05, 3.0 * voxel_size));
-    // Keep child halos inside the parent halo so their load cannot exceed its load.
-    if (parent.overlap > 0) overlap = std::min(overlap, parent.overlap);
-    const Aabb expanded = SpatialPart{parent.core, overlap}.expanded();
     constexpr int samples[] = {150, 100, 50};
-    double best = -std::numeric_limits<double>::infinity();
-    for (int rank = 0; rank < 3; ++rank) {
-        check_cancel(cancel);
-        const int axis = axes[(size_t)rank];
-        const AxisLoads& inner = core[axis];
-        if (inner.prefix.front().first == inner.prefix.back().first) continue;
-        AxisLoads outer;
-        for (const Voxel& voxel : voxels)
-            if (voxel.load > 0 && expanded.contains(voxel.center.data()))
-                outer.prefix.emplace_back(voxel.center[axis], voxel.load);
-        outer.accumulate();
-        double last = -std::numeric_limits<double>::infinity();
-        for (int i = 1; i <= samples[rank]; ++i) {
-            const size_t j = inner.quantile(double(i) / (samples[rank] + 1));
-            const double a = inner.prefix[j].first;
-            if (j + 1 == inner.prefix.size() || a == inner.prefix[j + 1].first) continue;
-            const double cut = a * 0.5 + inner.prefix[j + 1].first * 0.5;
-            if (cut <= a || cut <= last || cut <= parent.core.lo[axis] || cut >= parent.core.hi[axis]) continue;
-            last = cut;
-            const double l = outer.before(std::nextafter(cut + overlap, std::numeric_limits<double>::infinity()));
-            const double r = outer.total() - outer.before(cut - overlap);
-            const double score = score_cut(parent.gpixels, l, r, target);
-            if (score <= best || !std::isfinite(score)) continue;
-            best = score;
-            left = {parent.core, overlap, l};
-            right = {parent.core, overlap, r};
-            left.core.hi[axis] = cut;
-            right.core.lo[axis] = cut;
+    const auto find_cut = [&](double padding) {
+        const Aabb expanded = SpatialPart{parent.core, padding}.expanded();
+        const bool exhaustive = padding == 0;
+        double best = -std::numeric_limits<double>::infinity();
+        for (int rank = 0; rank < 3; ++rank) {
+            check_cancel(cancel);
+            const int axis = axes[(size_t)rank];
+            const AxisLoads& inner = core[axis];
+            if (inner.prefix.size() < 2) continue;
+            AxisLoads outer;
+            if (!exhaustive) {
+                for (const Voxel& voxel : voxels)
+                    if (voxel.load > 0 && expanded.contains(voxel.center.data()))
+                        outer.prefix.emplace_back(voxel.center[axis], voxel.load);
+                outer.accumulate();
+            }
+            double last = -std::numeric_limits<double>::infinity();
+            const size_t count = exhaustive ? inner.prefix.size() - 1 : samples[rank];
+            for (size_t i = 0; i < count; ++i) {
+                if (i % 4096 == 0) check_cancel(cancel);
+                const size_t j = exhaustive ? i : inner.quantile(double(i + 1) / (count + 1));
+                if (j + 1 == inner.prefix.size()) continue;
+                const double a = inner.prefix[j].first, b = inner.prefix[j + 1].first;
+                const double cut = a * 0.5 + b * 0.5;
+                if (cut <= a || cut >= b || cut <= last ||
+                    cut <= parent.core.lo[axis] || cut >= parent.core.hi[axis]) continue;
+                last = cut;
+                const double l = exhaustive ? inner.prefix[j].second :
+                    outer.before(std::nextafter(cut + padding, std::numeric_limits<double>::infinity()));
+                const double r = exhaustive ? inner.total() - l :
+                    outer.total() - outer.before(cut - padding);
+                const double peak = std::max(l, r);
+                if (!(l > 0 && r > 0 && peak < parent.gpixels)) continue;
+                const double score = exhaustive ? -peak : score_cut(parent.gpixels, l, r, target);
+                if (score <= best || !std::isfinite(score)) continue;
+                best = score;
+                left = {parent.core, padding, l};
+                right = {parent.core, padding, r};
+                left.core.hi[axis] = cut;
+                right.core.lo[axis] = cut;
+            }
         }
+        return exhaustive ? std::isfinite(best) : best >= -10.0;
+    };
+    for (int attempt = 0; attempt < 4 && overlap > 0; ++attempt, overlap *= 0.5)
+        if (find_cut(overlap)) return true;
+    return find_cut(0);
+}
+
+bool trim_overlap(SpatialPart& block, const std::vector<Voxel>& voxels, double target,
+                  const std::atomic<bool>* cancel) {
+    if (!(block.overlap > 0)) return false;
+    const auto load_at = [&](double overlap) {
+        check_cancel(cancel);
+        const Aabb box = SpatialPart{block.core, overlap}.expanded();
+        double sum = 0;
+        for (const Voxel& voxel : voxels)
+            if (box.contains(voxel.center.data())) sum += voxel.load;
+        return sum;
+    };
+    double lo = 0, hi = block.overlap, load = load_at(0);
+    if (load > target) return false;
+    for (int i = 0; i < 12; ++i) {
+        const double mid = lo * 0.5 + hi * 0.5;
+        const double candidate = load_at(mid);
+        if (candidate > target) hi = mid;
+        else { lo = mid; load = candidate; }
     }
-    return best >= -10.0;
+    block.overlap = lo;
+    block.gpixels = load;
+    return true;
 }
 
 std::vector<SpatialPart> split_space(const std::vector<Voxel>& voxels, SpatialPart root, double size,
@@ -210,13 +248,23 @@ std::vector<SpatialPart> split_space(const std::vector<Voxel>& voxels, SpatialPa
     const double cap = opt.lcc_overlap > 0 ? opt.lcc_overlap : std::numeric_limits<double>::infinity();
     while (queue.top().gpixels > opt.lcc_gpixels) {
         check_cancel(cancel);
-        if (queue.size() >= 254) throw std::runtime_error("partition: more than 254 parts");
+        SpatialPart block = queue.top();
+        const double overlap_limit = queue.size() == 1 ? cap : std::min(cap, block.overlap);
         SpatialPart left, right;
-        if (!split_block(queue.top(), voxels, size, cap, opt.lcc_gpixels, left, right, cancel))
-            throw std::runtime_error("partition: LCC has no valid split under the GPixels budget");
-        queue.pop();
-        queue.push(left);
-        queue.push(right);
+        if (split_block(block, voxels, size, overlap_limit, opt.lcc_gpixels, left, right, cancel)) {
+            if (queue.size() >= 254) throw std::runtime_error("partition: more than 254 parts");
+            queue.pop();
+            queue.push(left);
+            queue.push(right);
+        } else if (trim_overlap(block, voxels, opt.lcc_gpixels, cancel)) {
+            queue.pop();
+            queue.push(block);
+        } else {
+            std::ostringstream error;
+            error << "partition: LCC cannot split a " << block.gpixels << " GPixels block to fit "
+                  << opt.lcc_gpixels << " GPixels at voxel size " << size;
+            throw std::runtime_error(error.str());
+        }
     }
     std::vector<SpatialPart> out;
     while (!queue.empty()) {
@@ -342,6 +390,15 @@ void partition_lcc(const ParsedDataset& ds, ScenePartition& p, const PartitionLo
         }
     }
     if (root.gpixels <= 0) throw std::runtime_error("partition: LCC found no visible seed geometry");
+    const auto heaviest = std::max_element(voxels.begin(), voxels.end(),
+        [](const Voxel& a, const Voxel& b) { return a.load < b.load; });
+    if (heaviest->load > opt.lcc_gpixels) {
+        std::ostringstream error;
+        error << "partition: one LCC voxel carries " << heaviest->load << " GPixels, above the "
+              << opt.lcc_gpixels << " GPixels budget at voxel size " << size
+              << ". Use a smaller voxel size.";
+        throw std::runtime_error(error.str());
+    }
     p.spatial_parts = split_space(voxels, root, size, opt, cancel);
     p.num_parts = (int)p.spatial_parts.size();
     p.source = CovisibilitySource::Projection;

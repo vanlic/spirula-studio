@@ -256,12 +256,43 @@ void check_lcc_partition() {
     fs::remove(fs::path(file).replace_extension(".bin"));
 }
 
+void check_lcc_tight_budget() {
+    using namespace spirula;
+    ParsedDataset ds = make_corridor(1, 0, 1).ds;
+    for (int x = 0; x < 4; ++x) {
+        ds.points.xyz.insert(ds.points.xyz.end(), {x * 0.125, 0.0, 0.0});
+        ds.points.rgb.insert(ds.points.rgb.end(), {128, 128, 128});
+    }
+    PartitionOptions opt;
+    opt.method = PartitionMethod::Lcc;
+    opt.lcc_voxel_size = 0.125;
+    const Covisibility cov = build_covisibility(ds, nullptr, opt);
+    const double total = partition_scene(ds, cov, opt).spatial_parts.at(0).gpixels;
+    opt.lcc_gpixels = total * 0.40;
+    const ScenePartition split = partition_scene(ds, cov, opt);
+    check(split.num_parts >= 3 &&
+              std::all_of(split.spatial_parts.begin(), split.spatial_parts.end(), [&](const SpatialPart& p) {
+                  return p.gpixels > 0 && p.gpixels <= opt.lcc_gpixels && p.overlap < 0.375;
+              }),
+          "LCC reduces overlap to meet a tight budget around adjacent voxels");
+    opt.lcc_gpixels = total * 0.20;
+    std::string error;
+    try {
+        partition_scene(ds, cov, opt);
+    } catch (const std::runtime_error& e) {
+        error = e.what();
+    }
+    check(error.find("one LCC voxel carries") != std::string::npos,
+          "LCC reports when an individual voxel already exceeds the budget");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     using namespace spirula;
     if (argc == 2 && std::string(argv[1]) == "--lcc") {
         check_lcc_partition();
+        check_lcc_tight_budget();
         return g_failures != 0;
     }
     if (argc == 4 && std::string(argv[1]) == "--camera-metadata") {
@@ -325,6 +356,7 @@ int main(int argc, char** argv) {
     }
     check_voronoi_graph_free();
     check_lcc_partition();
+    check_lcc_tight_budget();
     const Corridor corr = make_corridor(60, 40, 5);
     const ParsedDataset& ds = corr.ds;
 
