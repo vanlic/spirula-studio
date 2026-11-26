@@ -1094,6 +1094,57 @@ SS_MSG(show_grid_help,
     RU("Цветные поверхности с пунктирными краями показывают области частей и границы слияния, включая пустое пространство."),
     TR("Renkli yüzler ve kesikli kenarlar, boş alandan geçenler dahil her parçanın alanını ve birleşme sınırını gösterir."));
 
+SS_MSG(projection_debug,
+    EN("Projection debug"), JA("投影デバッグ"), ZH_HANS("投影调试"), ZH_HANT("投影偵錯"),
+    KO("투영 디버그"), DE("Projektionsdiagnose"), FR("Diagnostic de projection"),
+    ES("Diagnóstico de proyección"), PT("Diagnóstico de projeção"), IT("Diagnostica proiezione"),
+    NL("Projectiediagnose"), RU("Отладка проекции"), TR("İzdüşüm tanılama"));
+SS_MSG(projection_camera,
+    EN("Camera"), JA("カメラ"), ZH_HANS("相机"), ZH_HANT("相機"), KO("카메라"),
+    DE("Kamera"), FR("Caméra"), ES("Cámara"), PT("Câmera"), IT("Fotocamera"),
+    NL("Camera"), RU("Камера"), TR("Kamera"));
+SS_MSG(projection_loading,
+    EN("Projecting camera view…"), JA("カメラビューを投影中…"), ZH_HANS("正在生成相机投影…"),
+    ZH_HANT("正在產生相機投影…"), KO("카메라 뷰 투영 중…"), DE("Kameraansicht wird projiziert…"),
+    FR("Projection de la vue…"), ES("Proyectando la vista…"), PT("Projetando a vista…"),
+    IT("Proiezione della vista…"), NL("Cameraweergave projecteren…"), RU("Построение проекции…"),
+    TR("Kamera görünümü izdüşürülüyor…"));
+SS_MSG(projection_unavailable,
+    EN("No projection grid for this camera."), JA("このカメラに投影グリッドはありません。"),
+    ZH_HANS("此相机没有投影网格。"), ZH_HANT("此相機沒有投影網格。"), KO("이 카메라의 투영 격자가 없습니다."),
+    DE("Kein Projektionsraster für diese Kamera."), FR("Cette caméra n’a pas de grille de projection."),
+    ES("Esta cámara no tiene rejilla de proyección."), PT("Esta câmera não tem grade de projeção."),
+    IT("Nessuna griglia di proiezione per questa fotocamera."), NL("Geen projectieraster voor deze camera."),
+    RU("Для этой камеры нет сетки проекции."), TR("Bu kameranın izdüşüm ızgarası yok."));
+SS_MSG(projection_coverage,
+    EN("Image coverage"), JA("画像の被覆率"), ZH_HANS("图像覆盖率"), ZH_HANT("影像覆蓋率"),
+    KO("이미지 점유율"), DE("Bildabdeckung"), FR("Couverture de l’image"), ES("Cobertura de imagen"),
+    PT("Cobertura da imagem"), IT("Copertura dell’immagine"), NL("Beelddekking"),
+    RU("Покрытие изображения"), TR("Görüntü kapsamı"));
+SS_MSG(projection_legend,
+    EN("Coverage uses the full image. White marks overlap between expanded parts."),
+    JA("被覆率は画像全体に対する割合です。白は拡張した区画の重なりです。"),
+    ZH_HANS("覆盖率以整张图像为分母。白色表示分块外扩后的重叠。"),
+    ZH_HANT("覆蓋率以整張影像為分母。白色表示分塊外擴後的重疊。"),
+    KO("전체 이미지 기준입니다. 흰색은 확장된 파트의 겹침입니다."),
+    DE("Die Abdeckung bezieht sich auf das ganze Bild. Weiß markiert überlappende erweiterte Blöcke."),
+    FR("La couverture porte sur l’image entière. Le blanc indique le chevauchement des blocs étendus."),
+    ES("La cobertura se calcula sobre toda la imagen. El blanco marca el solape de bloques ampliados."),
+    PT("A cobertura usa a imagem inteira. O branco marca a sobreposição dos blocos ampliados."),
+    IT("La copertura usa l’intera immagine. Il bianco indica la sovrapposizione dei blocchi estesi."),
+    NL("Dekking geldt voor het hele beeld. Wit markeert overlap van uitgebreide blokken."),
+    RU("Покрытие относится ко всему кадру. Белым показано пересечение расширенных блоков."),
+    TR("Kapsam tüm görüntüye göredir. Beyaz, genişletilmiş blokların örtüşmesini gösterir."));
+SS_MSG(projection_mask,
+    EN("Projection mask"), JA("投影マスク"), ZH_HANS("投影覆盖图"), ZH_HANT("投影覆蓋圖"),
+    KO("투영 마스크"), DE("Projektionsmaske"), FR("Masque de projection"), ES("Máscara de proyección"),
+    PT("Máscara de projeção"), IT("Maschera di proiezione"), NL("Projectiemasker"),
+    RU("Маска проекции"), TR("İzdüşüm maskesi"));
+SS_MSG(projection_photo,
+    EN("Source photo"), JA("元の写真"), ZH_HANS("原始照片"), ZH_HANT("原始照片"), KO("원본 사진"),
+    DE("Quellfoto"), FR("Photo source"), ES("Foto original"), PT("Foto original"), IT("Foto originale"),
+    NL("Bronfoto"), RU("Исходное фото"), TR("Kaynak fotoğraf"));
+
 SS_MSG(lbl_file, EN("File"), JA("ファイル"), ZH_HANS("文件"), ZH_HANT("檔案"), KO("파일"),
     DE("Datei"), FR("Fichier"), ES("Archivo"), PT("Ficheiro"), IT("File"), NL("Bestand"),
     RU("Файл"), TR("Dosya"));

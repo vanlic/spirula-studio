@@ -141,13 +141,15 @@ struct ScenePartition {
 };
 
 class LccLidarCache;
+class LccProjectionDebug;
 
 // The partition of `ds` by `cov`. Throws when the dataset has no cameras, and
 // PartitionCancelled once `cancel` is set.
 ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
                                const PartitionOptions& opt, const PartitionLog& log = {},
                                const std::atomic<bool>* cancel = nullptr,
-                               const SparseStats* tracks = nullptr, LccLidarCache* lidar_cache = nullptr);
+                               const SparseStats* tracks = nullptr, LccLidarCache* lidar_cache = nullptr,
+                               LccProjectionDebug* projection = nullptr);
 
 // partition.json beside a `.bin` of the same stem holding the volume and the
 // point tables. `dataset` is recorded as given.

@@ -9,7 +9,6 @@
 #include "app/gui/Ui.h"
 #include "checkpoint/SplatMerge.h"
 #include "checkpoint/SplatPly.h"
-#include "data/LccPartition.h"
 #include "i18n/catalog/Dataset.h"
 #include "i18n/catalog/Gui.h"
 #include "i18n/catalog/Partition.h"
@@ -52,6 +51,25 @@ ImVec4 part_vec(int part, float alpha = 1.0f) {
     return ImVec4(c[0], c[1], c[2], alpha);
 }
 
+void draw_part_swatch(int part) {
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const float h = ImGui::GetTextLineHeight();
+    ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(p.x, p.y + 2), ImVec2(p.x + h - 2, p.y + h - 2),
+                                            ImGui::GetColorU32(part_vec(part)), 2.0f);
+    ImGui::Dummy(ImVec2(h, h));
+    ImGui::SameLine();
+}
+
+void draw_projection_image(const PreviewTexture& texture, const spirula::i18n::Msg& title) {
+    ui::Text(title);
+    const ImVec2 box = ImGui::GetContentRegionAvail();
+    if (box.x <= 0 || box.y <= 0) return;
+    ImVec2 lo, hi;
+    fit_rect((float)texture.w, (float)texture.h, ImGui::GetCursorScreenPos(), box, lo, hi);
+    ImGui::GetWindowDrawList()->AddImage(texture.id(), lo, hi);
+    ImGui::Dummy(box);
+}
+
 }  // namespace
 
 PartitionPanel::PartitionPanel() = default;
@@ -79,6 +97,11 @@ void PartitionPanel::open(const std::string& dataset_dir, Hooks hooks) {
     _post = PostSplitCameras{};
     _tracks = spirula::SparseStats{};
     _part = spirula::ScenePartition{};
+    _projection = {};
+    _projection_frame = {};
+    _projection_camera = 0;
+    _projected_camera = _projection_part = -1;
+    _projection_error.clear();
     _part_meshes.clear();
     _error.clear();
     _status.clear();
@@ -99,13 +122,17 @@ void PartitionPanel::open(const std::string& dataset_dir, Hooks hooks) {
 void PartitionPanel::close() {
     _open = false;
     const Job job = _job.load();
-    if (job == Job::Compute || job == Job::LoadLidar) _cancel = true;
+    if (job == Job::Compute || job == Job::LoadLidar || job == Job::Projection) _cancel = true;
     if (_worker.joinable() && !_busy.load()) _worker.join();
     _lidar_cache.reset();
     _view.detach();
 }
 
-void PartitionPanel::destroy_gl() { _view.destroy_gl(); }
+void PartitionPanel::destroy_gl() {
+    _projection_texture.reset();
+    _projection_photo.reset();
+    _view.destroy_gl();
+}
 
 void PartitionPanel::set_lidar_cloud(const std::string& path) {
     if (!_open || _busy.load()) return;
@@ -152,6 +179,7 @@ void PartitionPanel::start(Job job) {
                 case Job::Load: run_load(); break;
                 case Job::LoadLidar: run_load_lidar(*cache); break;
                 case Job::Compute: run_compute(cache.get()); break;
+                case Job::Projection: run_projection(); break;
                 case Job::Merge: run_merge(); break;
                 case Job::None: break;
             }
@@ -222,7 +250,9 @@ void PartitionPanel::run_compute(spirula::LccLidarCache* cache) {
         _cov_opt = opt;
         _cov_valid = true;
     }
-    spirula::ScenePartition part = spirula::partition_scene(_ds, _cov, opt, log, &_cancel, &_tracks, cache);
+    spirula::LccProjectionDebug projection;
+    spirula::ScenePartition part = spirula::partition_scene(_ds, _cov, opt, log, &_cancel, &_tracks, cache,
+                                                            lcc ? &projection : nullptr);
     if (_cancel.load()) throw spirula::PartitionCancelled();
     std::vector<spirula::RegionMesh> meshes;
     if (lcc) {
@@ -244,7 +274,17 @@ void PartitionPanel::run_compute(spirula::LccLidarCache* cache) {
     }
     std::lock_guard<std::mutex> lk(_mu);
     _new_part = std::move(part);
+    _new_projection = std::move(projection);
     _new_meshes = std::move(meshes);
+}
+
+void PartitionPanel::run_projection() {
+    auto frame = _projection.project(_ds, _projection_request, &_cancel);
+    Picture photo;
+    load_picture(_ds.image_filenames[(size_t)_projection_request], "", 1024, photo);
+    if (_cancel.load()) throw spirula::PartitionCancelled();
+    _new_projection_frame = std::move(frame);
+    _new_projection_photo = std::move(photo);
 }
 
 void PartitionPanel::run_merge() {
@@ -285,7 +325,11 @@ void PartitionPanel::poll() {
         return;
     }
     if (!error.empty()) {
-        if (job == Job::Merge) _merge_error = error;
+        if (job == Job::Projection) {
+            _projection_error = error;
+            _projection_frame = {};
+            _projected_camera = _projection_request;
+        } else if (job == Job::Merge) _merge_error = error;
         else _status = error;
         if (_hooks.log) _hooks.log(error);
         if (job == Job::Load) _loaded = false;
@@ -304,6 +348,10 @@ void PartitionPanel::poll() {
             break;
         case Job::Compute:
             _part = std::move(_new_part);
+            _projection = std::move(_new_projection);
+            _projection_frame = {};
+            _projection_error.clear();
+            _projected_camera = _projection_part = -1;
             _part_meshes = std::move(_new_meshes);
             _part_opt = _compute_opt;
             _part_seed_count = _ds.points.num();
@@ -316,6 +364,15 @@ void PartitionPanel::poll() {
             _scanned = false;
             if (_show_part >= _part.num_parts) _show_part = -1;
             _view_dirty = true;
+            break;
+        case Job::Projection:
+            _projection_frame = std::move(_new_projection_frame);
+            _projected_camera = _projection_request;
+            _projection_error.clear();
+            if (_new_projection_photo.empty()) _projection_photo.reset();
+            else _projection_photo.upload(_new_projection_photo);
+            _new_projection_photo = {};
+            upload_projection();
             break;
         case Job::Merge:
             _merge_error.clear();
@@ -480,6 +537,25 @@ void PartitionPanel::draw() {
     ImGui::EndChild();
     ImGui::SameLine();
     ImGui::BeginChild("##partview", ImVec2(0, 0), ImGuiChildFlags_None);
+    if (!_projection) draw_scene_view();
+    else if (ImGui::BeginTabBar("##partition_view_tabs")) {
+        if (ui::BeginTabItem(gmsg::preview_mode_3d)) {
+            draw_scene_view();
+            ImGui::EndTabItem();
+        }
+        if (ui::BeginTabItem(pmsg::projection_debug)) {
+            draw_projection();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+    ImGui::EndChild();
+
+    ImGui::End();
+    if (!open) close();
+}
+
+void PartitionPanel::draw_scene_view() {
     const Job job = _job.load();
     if (_view.preview_active() || job == Job::LoadLidar) {
         const bool lidar_available = _lidar_points.num() != 0;
@@ -501,10 +577,118 @@ void PartitionPanel::draw() {
         ui::TextDisabled(job == Job::Load ? pmsg::status_reading
                          : job == Job::LoadLidar ? pmsg::status_reading_lidar : pmsg::status_computing);
     }
-    ImGui::EndChild();
+}
 
-    ImGui::End();
-    if (!open) close();
+void PartitionPanel::upload_projection() {
+    const auto& frame = _projection_frame;
+    if (frame.pixel_voxel.empty()) return;
+    std::vector<std::array<uint8_t, 3>> colors(frame.part_pixels.size());
+    for (size_t part = 0; part < colors.size(); ++part) {
+        float rgb[3];
+        spirula::part_color((int)part, rgb);
+        for (int k = 0; k < 3; ++k) colors[part][k] = (uint8_t)std::lround(255.0f * rgb[k]);
+    }
+    std::vector<uint8_t> rgb(frame.pixel_voxel.size() * 3, 20);
+    for (size_t pixel = 0; pixel < frame.pixel_voxel.size(); ++pixel) {
+        const int voxel = frame.pixel_voxel[pixel];
+        if (voxel < 0) continue;
+        const auto& parts = _projection.voxel_parts(voxel);
+        if (parts.empty()) continue;
+        uint8_t* dst = rgb.data() + 3 * pixel;
+        if (_projection_part >= 0) {
+            if (std::binary_search(parts.begin(), parts.end(), _projection_part)) {
+                const auto& color = colors[(size_t)_projection_part];
+                std::copy(color.begin(), color.end(), dst);
+            }
+        } else if (parts.size() == 1) {
+            const auto& color = colors[(size_t)parts.front()];
+            std::copy(color.begin(), color.end(), dst);
+        } else {
+            std::fill_n(dst, 3, (uint8_t)255);
+        }
+    }
+    _projection_texture.upload(rgb.data(), frame.width, frame.height);
+}
+
+void PartitionPanel::draw_projection() {
+    const auto& cameras = _part.frame_names;
+    const int count = (int)cameras.size();
+    if (count == 0) return;
+    _projection_camera = std::clamp(_projection_camera, 0, count - 1);
+    ImGui::SetNextItemWidth(std::min(px(360.0f), ImGui::GetContentRegionAvail().x * 0.65f));
+    if (ui::BeginCombo(pmsg::projection_camera, cameras[(size_t)_projection_camera].c_str())) {
+        ImGuiListClipper clipper;
+        clipper.Begin(count);
+        clipper.IncludeItemByIndex(_projection_camera);
+        while (clipper.Step()) {
+            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
+                ImGui::PushID(i);
+                if (ui::SelectableRaw(cameras[(size_t)i], i == _projection_camera)) _projection_camera = i;
+                if (i == _projection_camera) ImGui::SetItemDefaultFocus();
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    if (_projected_camera != _projection_camera) {
+        if (!_busy.load() && !_done.load()) {
+            _projection_request = _projection_camera;
+            start(Job::Projection);
+        }
+        ui::TextDisabled(pmsg::projection_loading);
+        return;
+    }
+    if (!_projection_error.empty()) {
+        ui::TextWrappedRaw(_projection_error);
+        return;
+    }
+    const auto& frame = _projection_frame;
+    const int area = frame.width * frame.height;
+    if (area == 0) {
+        ui::TextDisabled(pmsg::projection_unavailable);
+        return;
+    }
+
+    if (ui::Button(pmsg::show_all_parts) && _projection_part >= 0) {
+        _projection_part = -1;
+        upload_projection();
+    }
+    ui::TextDisabledWrapped(pmsg::projection_legend);
+    const float rows = (float)std::min(frame.part_pixels.size() + 1, size_t(6));
+    const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY;
+    if (ImGui::BeginTable("##projection_parts", 2, flags,
+                          ImVec2(0, ImGui::GetFrameHeightWithSpacing() * (rows + 0.5f)))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ui::TableSetupColumn(pmsg::col_part);
+        ui::TableSetupColumn(pmsg::projection_coverage);
+        ImGui::TableHeadersRow();
+        for (size_t part = 0; part < frame.part_pixels.size(); ++part) {
+            ImGui::TableNextRow();
+            ImGui::TableNextColumn();
+            draw_part_swatch((int)part);
+            if (ui::SelectableRaw(std::to_string(part), _projection_part == (int)part)) {
+                _projection_part = _projection_part == (int)part ? -1 : (int)part;
+                upload_projection();
+            }
+            ImGui::TableNextColumn();
+            char value[64];
+            const int pixels = frame.part_pixels[part];
+            std::snprintf(value, sizeof value, "%.2f%% (%d / %d)", 100.0 * pixels / area, pixels, area);
+            ui::TextRaw(value);
+        }
+        ImGui::EndTable();
+    }
+    const bool photo = _projection_photo.ready();
+    if (ImGui::BeginTable("##projection_images", photo ? 2 : 1, ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableNextColumn();
+        if (_projection_texture.ready()) draw_projection_image(_projection_texture, pmsg::projection_mask);
+        if (photo) {
+            ImGui::TableNextColumn();
+            draw_projection_image(_projection_photo, pmsg::projection_photo);
+        }
+        ImGui::EndTable();
+    }
 }
 
 void PartitionPanel::draw_controls() {
@@ -513,6 +697,7 @@ void PartitionPanel::draw_controls() {
     if (busy) {
         ui::TextDisabled(job == Job::Load ? pmsg::status_reading
                          : job == Job::LoadLidar ? pmsg::status_reading_lidar
+                         : job == Job::Projection ? pmsg::projection_loading
                          : job == Job::Merge ? pmsg::merge_head : pmsg::status_computing);
         if (job == Job::Compute || job == Job::LoadLidar) {
             ImGui::SameLine();
@@ -724,13 +909,7 @@ void PartitionPanel::draw_parts_table() {
         ImGui::TableNextRow();
         ImGui::TableNextColumn();
         ImGui::PushID(k);
-        const ImVec2 p = ImGui::GetCursorScreenPos();
-        const float h = ImGui::GetTextLineHeight();
-        ImGui::GetWindowDrawList()->AddRectFilled(
-            ImVec2(p.x, p.y + 2), ImVec2(p.x + h - 2, p.y + h - 2),
-            ImGui::GetColorU32(part_vec(k)), 2.0f);
-        ImGui::Dummy(ImVec2(h, h));
-        ImGui::SameLine();
+        draw_part_swatch(k);
         if (ui::SelectableRaw(std::to_string(k), _show_part == k)) {
             _show_part = _show_part == k ? -1 : k;
             _view_dirty = true;

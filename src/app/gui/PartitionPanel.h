@@ -5,8 +5,10 @@
 // queue the parts in Batch, and merge their models back into one. Opened from
 // the dataset screen beside "Open in Trainer"; docs/notes/scene-partition.md.
 
+#include "app/gui/PreviewTexture.h"
 #include "app/gui/ViewportPanel.h"
 #include "data/DatasetParser.h"
+#include "data/LccPartition.h"
 #include "data/RegionMesh.h"
 #include "data/ScenePartition.h"
 #include "data/SparseEdit.h"
@@ -45,15 +47,19 @@ public:
     void destroy_gl();
 
 private:
-    enum class Job { None, Load, LoadLidar, Compute, Merge };
+    enum class Job { None, Load, LoadLidar, Compute, Projection, Merge };
 
     void start(Job job);
     void run_load();
     void run_load_lidar(spirula::LccLidarCache& cache);
     void run_compute(spirula::LccLidarCache* cache);
+    void run_projection();
     void run_merge();
     void poll();
     void refresh_view();
+    void draw_scene_view();
+    void draw_projection();
+    void upload_projection();
     void draw_controls();
     void draw_parts_table();
     void draw_merge();
@@ -110,6 +116,16 @@ private:
     bool _owner_colors = true;
     bool _show_grid = true;
     bool _gl_ok = true;
+
+    spirula::LccProjectionDebug _projection, _new_projection;
+    spirula::LccFrameProjection _projection_frame, _new_projection_frame;
+    Picture _new_projection_photo;
+    PreviewTexture _projection_texture, _projection_photo;
+    int _projection_camera = 0;
+    int _projection_request = -1;
+    int _projected_camera = -1;
+    int _projection_part = -1;
+    std::string _projection_error;
 
     // ---- save / batch / merge ----
     std::string _save_path;

@@ -33,8 +33,9 @@ struct Voxel {
 
 struct ImageCoverage {
     std::vector<std::pair<int, int>> cells;
-    int raster_area = 0;
+    int cols = 0, rows = 0;
     double cell_load = 0;
+    int area() const { return cols * rows; }
 };
 
 struct SeedRows {
@@ -165,18 +166,18 @@ std::vector<Voxel> make_voxels(const double* xyz, const SeedRows& seeds, const d
 }
 
 ImageCoverage rasterize(const FrameView& view, const std::vector<Voxel>& voxels, double size,
-                        std::vector<int>& counts, const std::atomic<bool>* cancel) {
+                        std::vector<int>& counts, const std::atomic<bool>* cancel,
+                        std::vector<int>* pixel_voxel = nullptr) {
     const int w = view.cam.width, h = view.cam.height;
     ImageCoverage result;
     if (w <= 0 || h <= 0) return result;
     const double scale = double(kRasterSize) / std::max(w, h);
-    const int cols = std::clamp((int)std::ceil(w * scale), 1, kRasterSize);
-    const int rows = std::clamp((int)std::ceil(h * scale), 1, kRasterSize);
-    result.raster_area = cols * rows;
-    result.cell_load = 1.15 * double(w) * h / (kGiPixel * result.raster_area);
+    const int cols = result.cols = std::clamp((int)std::ceil(w * scale), 1, kRasterSize);
+    const int rows = result.rows = std::clamp((int)std::ceil(h * scale), 1, kRasterSize);
+    result.cell_load = 1.15 * double(w) * h / (kGiPixel * result.area());
     const double focal = std::max(std::abs(view.cam.fx), std::abs(view.cam.fy));
     const bool wrap = camhost::full_longitude(view.cam);
-    std::vector<double> depth((size_t)result.raster_area, std::numeric_limits<double>::infinity());
+    std::vector<double> depth((size_t)result.area(), std::numeric_limits<double>::infinity());
     std::vector<int> owner(depth.size(), -1);
     for (size_t i = 0; i < voxels.size(); ++i) {
         if (i % 4096 == 0 && cancel && cancel->load(std::memory_order_relaxed)) return {};
@@ -206,6 +207,7 @@ ImageCoverage rasterize(const FrameView& view, const std::vector<Voxel>& voxels,
         count = counts[(size_t)i];
         counts[(size_t)i] = 0;
     }
+    if (pixel_voxel) *pixel_voxel = std::move(owner);
     return result;
 }
 
@@ -380,9 +382,17 @@ std::vector<SpatialPart> split_space(const std::vector<Voxel>& voxels, SpatialPa
     return out;
 }
 
-void assign_training_data(const ParsedDataset& ds, const SeedRows& seeds, const std::vector<Voxel>& voxels,
-                          const std::vector<ImageCoverage>& images, ScenePartition& p,
-                          const std::atomic<bool>* cancel) {
+void count_part_pixels(const ImageCoverage& image, const std::vector<std::vector<int>>& voxel_parts,
+                       std::vector<int>& counts) {
+    std::fill(counts.begin(), counts.end(), 0);
+    for (const auto& [voxel, count] : image.cells)
+        for (int part : voxel_parts[(size_t)voxel]) counts[(size_t)part] += count;
+}
+
+std::vector<std::vector<int>> assign_training_data(const ParsedDataset& ds, const SeedRows& seeds,
+                                                   const std::vector<Voxel>& voxels,
+                                                   const std::vector<ImageCoverage>& images, ScenePartition& p,
+                                                   const std::atomic<bool>* cancel) {
     std::vector<Aabb> expanded;
     for (const SpatialPart& block : p.spatial_parts) expanded.push_back(block.expanded());
     std::vector<std::vector<int>> in_voxel(voxels.size());
@@ -404,13 +414,11 @@ void assign_training_data(const ParsedDataset& ds, const SeedRows& seeds, const 
         check_cancel(cancel);
         const ImageCoverage& image = images[c];
         if (image.cells.empty()) continue;
-        std::fill(coverage.begin(), coverage.end(), 0);
-        for (const auto& [voxel, count] : image.cells)
-            for (int k : in_voxel[(size_t)voxel]) coverage[(size_t)k] += count;
+        count_part_pixels(image, in_voxel, coverage);
         const auto primary = std::max_element(coverage.begin(), coverage.end());
-        if (*primary > kCoverage * image.raster_area) p.frame_label[c] = (int32_t)(primary - coverage.begin());
+        if (*primary > kCoverage * image.area()) p.frame_label[c] = (int32_t)(primary - coverage.begin());
         for (size_t k = 0; k < n; ++k) {
-            const double share = double(coverage[k]) / image.raster_area;
+            const double share = double(coverage[k]) / image.area();
             if (share > best_share[k]) {
                 best_share[k] = share;
                 best_frame[k] = (int)c;
@@ -436,9 +444,37 @@ void assign_training_data(const ParsedDataset& ds, const SeedRows& seeds, const 
             if (p.spatial_parts[k].owns(q)) p.point_label[(size_t)row] = (int32_t)k;
         }
     }
+    return in_voxel;
 }
 
 }  // namespace
+
+struct LccProjectionDebug::Data {
+    std::vector<Voxel> voxels;
+    std::vector<std::vector<int>> voxel_parts;
+    double voxel_size;
+    int num_parts;
+};
+
+LccFrameProjection LccProjectionDebug::project(const ParsedDataset& ds, int64_t camera,
+                                                const std::atomic<bool>* cancel) const {
+    if (!_data || camera < 0 || camera >= ds.num_cameras) return {};
+    check_cancel(cancel);
+    LccFrameProjection frame;
+    std::vector<int> counts(_data->voxels.size(), 0);
+    const ImageCoverage image = rasterize(frame_view(ds, camera), _data->voxels, _data->voxel_size,
+                                          counts, cancel, &frame.pixel_voxel);
+    check_cancel(cancel);
+    frame.width = image.cols;
+    frame.height = image.rows;
+    frame.part_pixels.resize((size_t)_data->num_parts);
+    count_part_pixels(image, _data->voxel_parts, frame.part_pixels);
+    return frame;
+}
+
+const std::vector<int>& LccProjectionDebug::voxel_parts(int voxel) const {
+    return _data->voxel_parts[(size_t)voxel];
+}
 
 void LccLidarCache::prepare(const std::string& path) {
     const auto file = std::filesystem::u8path(path);
@@ -474,7 +510,8 @@ const std::vector<double>& LccLidarCache::sample(const ParsedDataset& ds, const 
 }
 
 void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePartition& p,
-                   const PartitionLog& log, const std::atomic<bool>* cancel, LccLidarCache* lidar_cache) {
+                   const PartitionLog& log, const std::atomic<bool>* cancel,
+                   LccLidarCache* lidar_cache, LccProjectionDebug* projection) {
     const PartitionOptions& opt = p.options;
     const bool use_lidar = !opt.lcc_lidar_cloud.empty();
     if (opt.parts != 0 || opt.max_projected_points < 1 || !std::isfinite(opt.lcc_gpixels) ||
@@ -572,7 +609,7 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
     p.spatial_parts = split_space(voxels, root, size, opt, cancel);
     p.num_parts = (int)p.spatial_parts.size();
     p.source = CovisibilitySource::Projection;
-    assign_training_data(ds, seeds, voxels, images, p, cancel);
+    auto voxel_parts = assign_training_data(ds, seeds, voxels, images, p, cancel);
     for (SpatialPart& block : p.spatial_parts)
         for (int axis = 0; axis < 3; ++axis) {
             block.core.lo[axis] += ds.center[(size_t)axis];
@@ -582,6 +619,9 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
         for (int k = 0; k < p.num_parts; ++k)
             log("LCC part " + std::to_string(k) + ": " +
                 std::to_string(p.spatial_parts[(size_t)k].gpixels) + " GPixels");
+    if (projection)
+        projection->_data = std::make_shared<LccProjectionDebug::Data>(
+            LccProjectionDebug::Data{std::move(voxels), std::move(voxel_parts), size, p.num_parts});
 }
 
 }  // namespace spirula

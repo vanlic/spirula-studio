@@ -941,7 +941,7 @@ std::shared_ptr<const Region> ScenePartition::training_region(int part) const {
 ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
                                const PartitionOptions& opt, const PartitionLog& log,
                                const std::atomic<bool>* cancel, const SparseStats* tracks,
-                               LccLidarCache* lidar_cache) {
+                               LccLidarCache* lidar_cache, LccProjectionDebug* projection) {
     const int64_t n_cam = ds.num_cameras;
     if (n_cam == 0) throw std::runtime_error("partition: the dataset has no cameras");
     if (!cov.camera_graph_built && opt.method != PartitionMethod::Voronoi && opt.method != PartitionMethod::Lcc)
@@ -957,7 +957,7 @@ ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
     p.source = cov.source;
     p.frame_names = FrameIndex(ds.image_filenames).unique_tails();
     if (opt.method == PartitionMethod::Lcc) {
-        partition_lcc(ds, tracks, p, log, cancel, lidar_cache);
+        partition_lcc(ds, tracks, p, log, cancel, lidar_cache, projection);
         return p;
     }
 

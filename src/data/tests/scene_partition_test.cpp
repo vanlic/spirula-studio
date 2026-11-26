@@ -207,9 +207,33 @@ void check_lcc_partition() {
     const Covisibility cov = build_covisibility(ds, nullptr, opt);
     const ScenePartition whole = partition_scene(ds, cov, opt);
     opt.lcc_gpixels = whole.spatial_parts.at(0).gpixels * 0.64;
-    const ScenePartition p = partition_scene(ds, cov, opt);
+    LccProjectionDebug projection;
+    const ScenePartition p = partition_scene(ds, cov, opt, {}, nullptr, nullptr, nullptr, &projection);
     check(p.num_parts == 2 && !cov.camera_graph_built && !p.field, "LCC splits by pixel budget");
     if (p.num_parts != 2) return;
+    bool matching_pixels = true, matching_frames = true, has_overlap = false;
+    for (int32_t camera = 0; camera < ds.num_cameras; ++camera) {
+        const auto frame = projection.project(ds, camera);
+        const int area = frame.width * frame.height;
+        std::vector<int> counts((size_t)p.num_parts, 0);
+        for (int voxel : frame.pixel_voxel) {
+            if (voxel < 0) continue;
+            const auto& parts = projection.voxel_parts(voxel);
+            has_overlap |= parts.size() > 1;
+            for (int k : parts) ++counts[(size_t)k];
+        }
+        matching_pixels &= area > 0 && frame.pixel_voxel.size() == (size_t)area && counts == frame.part_pixels;
+        const auto primary = std::max_element(counts.begin(), counts.end());
+        const int expected = *primary > 0.03 * area ? (int)(primary - counts.begin()) : -1;
+        matching_frames &= p.frame_label[(size_t)camera] == expected;
+        for (int k = 0; k < p.num_parts; ++k) {
+            if (counts[(size_t)k] <= 0.03 * area || expected == k) continue;
+            const auto& ring = p.ring[(size_t)k];
+            matching_frames &= std::binary_search(ring.begin(), ring.end(), camera);
+        }
+    }
+    check(matching_pixels && has_overlap, "LCC debug maps count shared pixels for both parts");
+    check(matching_frames, "LCC debug coverage agrees with camera assignment");
     const Aabb& first = p.spatial_parts[0].core;
     const Aabb& second = p.spatial_parts[1].core;
     int axis = 0;
