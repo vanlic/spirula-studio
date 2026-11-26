@@ -143,15 +143,31 @@ RegionMesh region_boundary_mesh(const Region& r, const Aabb& box, int cells_long
     return extract(g, lab, 1, [&](const double* p) { return r.contains(p); });
 }
 
-RegionMesh box_boundary_mesh(const Aabb& box) {
+RegionMesh box_boundary_mesh(const Aabb& box, const Aabb& clip, const double origin[3]) {
     RegionMesh mesh;
-    if (box.empty() || box.unbounded()) return mesh;
+    Aabb visible;
+    for (int axis = 0; axis < 3; ++axis) {
+        visible.lo[axis] = std::max(box.lo[axis], clip.lo[axis]);
+        visible.hi[axis] = std::min(box.hi[axis], clip.hi[axis]);
+        if (visible.lo[axis] >= visible.hi[axis]) return mesh;
+    }
+    constexpr uint32_t faces[3][2][6] = {
+        {{0, 4, 6, 0, 6, 2}, {1, 3, 7, 1, 7, 5}},
+        {{0, 1, 5, 0, 5, 4}, {2, 6, 7, 2, 7, 3}},
+        {{0, 2, 3, 0, 3, 1}, {4, 5, 7, 4, 7, 6}},
+    };
+    for (int axis = 0; axis < 3; ++axis) {
+        if (visible.lo[axis] == box.lo[axis])
+            mesh.tri.insert(mesh.tri.end(), faces[axis][0], faces[axis][0] + 6);
+        if (visible.hi[axis] == box.hi[axis])
+            mesh.tri.insert(mesh.tri.end(), faces[axis][1], faces[axis][1] + 6);
+    }
+    if (mesh.empty()) return mesh;
     for (int corner = 0; corner < 8; ++corner)
-        for (int axis = 0; axis < 3; ++axis)
-            mesh.xyz.push_back((float)((corner & (1 << axis)) ? box.hi[axis] : box.lo[axis]));
-    mesh.tri = {0, 2, 3, 0, 3, 1, 4, 5, 7, 4, 7, 6,
-                0, 1, 5, 0, 5, 4, 2, 6, 7, 2, 7, 3,
-                0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5};
+        for (int axis = 0; axis < 3; ++axis) {
+            const double coord = (corner & (1 << axis)) ? visible.hi[axis] : visible.lo[axis];
+            mesh.xyz.push_back((float)(coord - origin[axis]));
+        }
     return mesh;
 }
 

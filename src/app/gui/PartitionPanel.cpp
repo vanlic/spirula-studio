@@ -226,9 +226,11 @@ void PartitionPanel::run_compute(spirula::LccLidarCache* cache) {
     if (_cancel.load()) throw spirula::PartitionCancelled();
     std::vector<spirula::RegionMesh> meshes;
     if (lcc) {
-        for (const spirula::SpatialPart& spatial : part.spatial_parts) {
+        const auto ownership = part.spatial_ownership_parts();
+        for (size_t k = 0; k < ownership.size(); ++k) {
             if (_cancel.load()) throw spirula::PartitionCancelled();
-            meshes.push_back(spirula::box_boundary_mesh(spatial.core));
+            meshes.push_back(spirula::box_boundary_mesh(ownership[k].core, part.spatial_parts[k].core,
+                                                        _ds.center.data()));
         }
     } else if (part.field && !part.field->empty()) {
         std::vector<float> xyz;
@@ -432,8 +434,8 @@ void PartitionPanel::refresh_view() {
             }
         }
         if (_show_grid && !_part_meshes.empty()) {
-            // Each part's boundary: the field is in the dataset's frame, the
-            // points it is drawn with less their centre.
+            const bool spatial = !_part.spatial_parts.empty();
+            // Spatial meshes are already centered to retain sub-unit precision at large coordinates.
             const float to_points[12] = {1, 0, 0, (float)-_ds.center[0], 0, 1, 0, (float)-_ds.center[1],
                                          0, 0, 1, (float)-_ds.center[2]};
             auto ov = std::make_shared<spirula::RegionOverlay>();
@@ -441,9 +443,9 @@ void PartitionPanel::refresh_view() {
                 if (solo >= 0 && k != solo) continue;
                 float c[3];
                 spirula::part_color(k, c);
-                ov->add(_part_meshes[(size_t)k], c, to_points);
+                ov->add(_part_meshes[(size_t)k], c, spatial ? nullptr : to_points, !spatial);
             }
-            overlay = ov;
+            if (!ov->empty()) overlay = std::move(ov);
         }
     }
     _view.attach_preview_data(show, _post, "partition:" + _dataset, 1.0f, n_cam > 0, nullptr,

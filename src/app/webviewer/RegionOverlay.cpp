@@ -33,7 +33,7 @@ void blend(uint8_t* px, const float rgb[3], float a) {
 
 }  // namespace
 
-void RegionOverlay::add(const RegionMesh& m, const float rgb[3], const float to_frame[12]) {
+void RegionOverlay::add(const RegionMesh& m, const float rgb[3], const float to_frame[12], bool smooth) {
     if (m.empty()) return;
     Layer l;
     l.xyz.resize(m.xyz.size());
@@ -46,28 +46,29 @@ void RegionOverlay::add(const RegionMesh& m, const float rgb[3], const float to_
     }
     l.tri = m.tri;
     for (int k = 0; k < 3; k++) l.rgb[k] = rgb[k];
-    // Surface nets leave a bump per cell, and every bump puts a silhouette
-    // edge in the outline; a few rounds of neighbour averaging take them out.
-    const size_t n_v = l.xyz.size() / 3;
-    std::vector<float> sum(n_v * 3);
-    std::vector<int> cnt(n_v);
-    for (int round = 0; round < 6; round++) {
-        std::fill(sum.begin(), sum.end(), 0.0f);
-        std::fill(cnt.begin(), cnt.end(), 0);
-        for (size_t t = 0; t < l.tri.size(); t += 3)
-            for (int e = 0; e < 3; e++) {
-                const uint32_t a = l.tri[t + e], b = l.tri[t + (e + 1) % 3];
-                for (int r = 0; r < 3; r++) {
-                    sum[a * 3 + r] += l.xyz[b * 3 + r];
-                    sum[b * 3 + r] += l.xyz[a * 3 + r];
+    // Surface-net bumps create spurious silhouette edges.
+    if (smooth) {
+        const size_t n_v = l.xyz.size() / 3;
+        std::vector<float> sum(n_v * 3);
+        std::vector<int> cnt(n_v);
+        for (int round = 0; round < 6; round++) {
+            std::fill(sum.begin(), sum.end(), 0.0f);
+            std::fill(cnt.begin(), cnt.end(), 0);
+            for (size_t t = 0; t < l.tri.size(); t += 3)
+                for (int e = 0; e < 3; e++) {
+                    const uint32_t a = l.tri[t + e], b = l.tri[t + (e + 1) % 3];
+                    for (int r = 0; r < 3; r++) {
+                        sum[a * 3 + r] += l.xyz[b * 3 + r];
+                        sum[b * 3 + r] += l.xyz[a * 3 + r];
+                    }
+                    cnt[a]++;
+                    cnt[b]++;
                 }
-                cnt[a]++;
-                cnt[b]++;
-            }
-        for (size_t v = 0; v < n_v; v++)
-            if (cnt[v] > 0)
-                for (int r = 0; r < 3; r++)
-                    l.xyz[v * 3 + r] = 0.5f * l.xyz[v * 3 + r] + 0.5f * sum[v * 3 + r] / (float)cnt[v];
+            for (size_t v = 0; v < n_v; v++)
+                if (cnt[v] > 0)
+                    for (int r = 0; r < 3; r++)
+                        l.xyz[v * 3 + r] = 0.5f * l.xyz[v * 3 + r] + 0.5f * sum[v * 3 + r] / (float)cnt[v];
+        }
     }
     std::unordered_map<uint64_t, uint32_t> seen;
     for (size_t t = 0; t < l.tri.size() / 3; t++)

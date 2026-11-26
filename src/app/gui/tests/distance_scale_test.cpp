@@ -3,6 +3,7 @@
 #include "app/gui/edit/DistanceScaleTool.h"
 #include "app/gui/edit/SelectShape.h"
 #include "app/webviewer/RegionOverlay.h"
+#include "data/ScenePartition.h"
 
 #include <cmath>
 #include <cstdio>
@@ -60,6 +61,38 @@ void test_orthographic_overlay() {
         if (pixels[(y*128+x)*3]) count[x < 50 ? 0 : x > 78 ? 1 : 2]++;
     check(count[0] > 10 && count[0] == count[1] && count[2] == 0,
           "orthographic ROI overlay footprint and camera-plane culling");
+}
+
+void test_partition_cut_overlay() {
+    using namespace spirula;
+    const double origin[3] = {7000000, 5000000, 1000000};
+    const float color[3] = {1, 0, 0};
+    for (int axis = 0; axis < 3; ++axis) {
+        ScenePartition p;
+        p.spatial_parts.resize(2);
+        for (SpatialPart& part : p.spatial_parts)
+            for (int k = 0; k < 3; ++k) {
+                part.core.lo[k] = origin[k] - 3;
+                part.core.hi[k] = origin[k] + 4;
+            }
+        const double cut = origin[axis] + 0.125;
+        p.spatial_parts[0].core.hi[axis] = cut;
+        p.spatial_parts[1].core.lo[axis] = cut;
+        const auto ownership = p.spatial_ownership_parts();
+        for (size_t k = 0; k < ownership.size(); ++k) {
+            const RegionMesh mesh = box_boundary_mesh(ownership[k].core, p.spatial_parts[k].core, origin);
+            RegionOverlay overlay;
+            overlay.add(mesh, color, nullptr, false);
+            const bool present = overlay.layers.size() == 1 && mesh.tri.size() == 6;
+            check(present, "only the internal partition face is drawn");
+            if (!present) continue;
+            const auto& layer = overlay.layers.front();
+            bool exact = layer.xyz == mesh.xyz;
+            for (uint32_t vertex : layer.tri)
+                exact = exact && layer.xyz[vertex * 3 + axis] == 0.125f;
+            check(exact, "partition overlay keeps the cut plane and its corners");
+        }
+    }
 }
 
 void test_initial_state() {
@@ -131,6 +164,7 @@ void test_reset() {
 int main() {
     test_orthographic_selection();
     test_orthographic_overlay();
+    test_partition_cut_overlay();
     test_initial_state();
     test_distance_and_scale();
     test_reset();

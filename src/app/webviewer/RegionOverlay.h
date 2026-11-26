@@ -29,7 +29,8 @@ struct RegionOverlay {
     bool empty() const { return layers.empty() && !region; }
 
     // `to_frame` maps the mesh into the overlay's frame, row-major 3x4.
-    void add(const RegionMesh& m, const float rgb[3], const float to_frame[12] = nullptr);
+    void add(const RegionMesh& m, const float rgb[3], const float to_frame[12] = nullptr,
+             bool smooth = true);
 };
 
 // Outline segments [S,2,3] of a layer seen from `eye`: edges between a face
