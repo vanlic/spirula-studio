@@ -97,7 +97,7 @@ struct Gray {
     std::vector<uint8_t> px;
 };
 
-Gray load_gray(const std::string& path) {
+Gray load_gray(const std::string& path, bool apply_exif = true) {
     Gray g;
     int comp = 0;
     if (imagefile::handles(path)) {
@@ -115,7 +115,7 @@ Gray load_gray(const std::string& path) {
     stbi_image_free(d);
     // Displayed, not stored: a stencil's shapes were drawn on the picture the
     // way up it is shown, and the border fit has to agree with them.
-    turn_pixels(photo_turn(path), 1, g.px, g.w, g.h);
+    if (apply_exif) turn_pixels(photo_turn(path), 1, g.px, g.w, g.h);
     return g;
 }
 
@@ -1000,7 +1000,8 @@ BorderDetect BorderAccumulator::finish(const BorderDetectOptions& o) const {
 }
 
 BorderDetect detect_fisheye_border(const std::vector<std::string>& files,
-                                   const BorderDetectOptions& o) {
+                                   const BorderDetectOptions& o, bool apply_exif,
+                                   const std::atomic<bool>* cancel) {
     if (files.empty()) return BorderDetect{};
     const int want = std::max(2, o.samples);
     std::vector<size_t> pick;
@@ -1013,7 +1014,8 @@ BorderDetect detect_fisheye_border(const std::vector<std::string>& files,
     }
     BorderAccumulator acc;
     for (size_t i : pick) {
-        Gray f = load_gray(files[i]);
+        if (cancel && cancel->load(std::memory_order_relaxed)) return {};
+        Gray f = load_gray(files[i], apply_exif);
         if (!f.px.empty()) acc.add(f.px.data(), f.w, f.h, 1);
     }
     return acc.finish(o);

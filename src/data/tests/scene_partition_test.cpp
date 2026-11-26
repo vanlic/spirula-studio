@@ -299,6 +299,48 @@ void check_lcc_partition() {
     fs::remove(fs::path(file).replace_extension(".bin"));
 }
 
+void check_lcc_projection_masks() {
+    using namespace spirula;
+    ParsedDataset ds = make_corridor(8, 0, 1).ds;
+    for (int x = 0; x <= 56; ++x)
+        for (int y = -12; y <= 12; ++y)
+            ds.points.xyz.insert(ds.points.xyz.end(), {x * 0.125, y * 0.125, 0.0});
+    ds.points.rgb.resize(ds.points.xyz.size(), 128);
+    PartitionOptions opt;
+    opt.method = PartitionMethod::Lcc;
+    opt.lcc_voxel_size = 0.125;
+    const auto cov = build_covisibility(ds, nullptr, opt);
+    LccProjectionDebug unmasked;
+    const auto full = partition_scene(ds, cov, opt, {}, nullptr, nullptr, nullptr, &unmasked);
+    const auto before = unmasked.project(ds, 0);
+    LccProjectionMasks masks;
+    masks.frames.resize((size_t)ds.num_cameras);
+    auto half = std::make_shared<LccRasterMask>();
+    for (int y = 0; y < before.height / 2; ++y)
+        for (int x = 0; x < before.width; ++x)
+            half->set((size_t)y * before.width + x);
+    masks.frames[0] = half;
+    masks.frames[1] = std::make_shared<LccRasterMask>();
+    LccProjectionDebug masked;
+    const auto p = partition_scene(ds, cov, opt, {}, nullptr, nullptr, nullptr, &masked, &masks);
+    const auto partial = masked.project(ds, 0);
+    const auto empty = masked.project(ds, 1);
+    const auto unchanged = masked.project(ds, 2);
+    bool clipped = partial.pixel_voxel.size() == before.pixel_voxel.size();
+    for (size_t i = 0; clipped && i < partial.pixel_voxel.size(); ++i)
+        clipped = partial.pixel_voxel[i] == ((*half)[i] ? before.pixel_voxel[i] : -1);
+    check(clipped && partial.valid_pixels == (int)half->count() && partial.part_pixels.at(0) > 0 &&
+              partial.part_pixels[0] < before.part_pixels.at(0),
+          "LCC mask clips the footprint and defines the coverage denominator");
+    check(empty.valid_pixels == 0 && empty.part_pixels.at(0) == 0 && p.frame_label[1] == -1 &&
+              !std::binary_search(p.ring[0].begin(), p.ring[0].end(), 1),
+          "LCC skips a fully masked camera when assigning frames");
+    check(unchanged.valid_pixels == unchanged.width * unchanged.height &&
+              unchanged.pixel_voxel == unmasked.project(ds, 2).pixel_voxel &&
+              p.spatial_parts.at(0).gpixels < full.spatial_parts.at(0).gpixels,
+          "LCC keeps unmasked views and lowers masked pixel load");
+}
+
 void check_lcc_tight_budget() {
     using namespace spirula;
     ParsedDataset ds = make_corridor(1, 0, 1).ds;
@@ -505,6 +547,7 @@ int main(int argc, char** argv) {
     using namespace spirula;
     if (argc == 2 && std::string(argv[1]) == "--lcc") {
         check_lcc_partition();
+        check_lcc_projection_masks();
         check_lcc_tight_budget();
         check_lcc_track_filter();
         check_lcc_robust_bounds();
@@ -572,6 +615,7 @@ int main(int argc, char** argv) {
     }
     check_voronoi_graph_free();
     check_lcc_partition();
+    check_lcc_projection_masks();
     check_lcc_tight_budget();
     check_lcc_track_filter();
     check_lcc_robust_bounds();

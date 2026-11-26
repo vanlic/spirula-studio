@@ -3,6 +3,7 @@
 #include "app/gui/PartitionPanel.h"
 
 #include "app/E57Dataset.h"
+#include "app/LccImageMasks.h"
 #include "app/webviewer/RegionOverlay.h"
 
 #include "app/gui/Layout.h"
@@ -79,11 +80,17 @@ PartitionPanel::~PartitionPanel() {
     if (_worker.joinable()) _worker.join();
 }
 
-void PartitionPanel::open(const std::string& dataset_dir, Hooks hooks) {
+void PartitionPanel::open(const std::string& dataset_dir, const std::string& image_dir,
+                          const std::string& mask_dir, bool mask_flipped, Hooks hooks) {
     if (_busy.load()) return;
     if (_worker.joinable()) _worker.join();
     _open = true;
     _dataset = dataset_dir;
+    _parser = {};
+    _parser.require_image_files = false;
+    if (!image_dir.empty()) _parser.image_dir = image_dir;
+    if (!mask_dir.empty()) _parser.mask_dir = mask_dir;
+    _mask_flipped = mask_flipped;
     _opt.lcc_lidar_cloud.clear();
     _opt.lcc_lidar_sample_fraction = 0.0;
     _lidar_path_edit.clear();
@@ -196,9 +203,7 @@ void PartitionPanel::start(Job job) {
 }
 
 void PartitionPanel::run_load() {
-    DatasetParserConfig dcfg;
-    dcfg.require_image_files = false;
-    ParsedDataset ds = parse_dataset(_dataset, dcfg, "");
+    ParsedDataset ds = parse_dataset(_dataset, _parser, "");
     PostSplitCameras post = bake_post_split(ds, false, false);
     spirula::SparseStats tracks = spirula::read_sparse_stats(_dataset);
     std::lock_guard<std::mutex> lk(_mu);
@@ -251,8 +256,10 @@ void PartitionPanel::run_compute(spirula::LccLidarCache* cache) {
         _cov_valid = true;
     }
     spirula::LccProjectionDebug projection;
+    const auto masks = lcc ? app::load_lcc_image_masks(_ds, _mask_flipped, log, &_cancel)
+                           : spirula::LccProjectionMasks{};
     spirula::ScenePartition part = spirula::partition_scene(_ds, _cov, opt, log, &_cancel, &_tracks, cache,
-                                                            lcc ? &projection : nullptr);
+                                                            lcc ? &projection : nullptr, &masks);
     if (_cancel.load()) throw spirula::PartitionCancelled();
     std::vector<spirula::RegionMesh> meshes;
     if (lcc) {
@@ -644,8 +651,7 @@ void PartitionPanel::draw_projection() {
         return;
     }
     const auto& frame = _projection_frame;
-    const int area = frame.width * frame.height;
-    if (area == 0) {
+    if (frame.width == 0 || frame.height == 0) {
         ui::TextDisabled(pmsg::projection_unavailable);
         return;
     }
@@ -674,7 +680,11 @@ void PartitionPanel::draw_projection() {
             ImGui::TableNextColumn();
             char value[64];
             const int pixels = frame.part_pixels[part];
-            std::snprintf(value, sizeof value, "%.2f%% (%d / %d)", 100.0 * pixels / area, pixels, area);
+            if (frame.valid_pixels > 0)
+                std::snprintf(value, sizeof value, "%.2f%% (%d / %d)", 100.0 * pixels / frame.valid_pixels,
+                              pixels, frame.valid_pixels);
+            else
+                std::snprintf(value, sizeof value, "-- (0 / 0)");
             ui::TextRaw(value);
         }
         ImGui::EndTable();

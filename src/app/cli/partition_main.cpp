@@ -3,6 +3,7 @@
 // (checkpoint/SplatMerge.h). Host-only; every build has it.
 
 #include "app/Tools.h"
+#include "app/LccImageMasks.h"
 
 #include "checkpoint/SplatMerge.h"
 #include "checkpoint/SplatPly.h"
@@ -177,8 +178,10 @@ int run_split(int argc, char** argv) {
     else if (!lcc)
         std::printf("%s\n", format(P::log_covisibility_without_graph,
                                    {spirula::covisibility_source_name(cov.source)}).c_str());
+    const auto masks = lcc ? app::load_lcc_image_masks(ds, false, log) : spirula::LccProjectionMasks{};
     const spirula::ScenePartition part = spirula::partition_scene(
-        ds, cov, opt, lcc ? spirula::PartitionLog(log) : spirula::PartitionLog{}, nullptr, &tracks);
+        ds, cov, opt, lcc ? spirula::PartitionLog(log) : spirula::PartitionLog{}, nullptr, &tracks,
+        nullptr, nullptr, &masks);
     char cut[32];
     std::snprintf(cut, sizeof cut, "%.1f", 100.0 * part.cut_fraction);
     if (lcc) {

@@ -115,6 +115,7 @@ list(APPEND SS_TOOL_DEFS SS_TOOL_TRAIN=1)
 # ---- scene partitioning: split a dataset for training in parts, merge back ----
 # Host-only over the parsers and the splat PLY reader, so every build has it.
 list(APPEND SS_TOOL_SOURCES ${SS_SRC}/app/cli/partition_main.cpp)
+list(APPEND SS_TOOL_SOURCES ${SS_SRC}/app/LccImageMasks.cpp)
 list(APPEND SS_TOOL_DEFS SS_TOOL_PARTITION=1)
 list(APPEND SS_TOOL_SOURCES ${SS_SRC}/app/cli/dense_main.cpp)
 list(APPEND SS_TOOL_DEFS SS_TOOL_DENSE=1)

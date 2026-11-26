@@ -17,9 +17,16 @@
 #include <utility>
 
 namespace spirula {
+
+std::array<int, 2> lcc_raster_dimensions(int width, int height) {
+    if (width <= 0 || height <= 0) return {0, 0};
+    const double scale = double(kLccRasterSize) / std::max(width, height);
+    return {std::clamp((int)std::ceil(width * scale), 1, kLccRasterSize),
+            std::clamp((int)std::ceil(height * scale), 1, kLccRasterSize)};
+}
+
 namespace {
 
-constexpr int kRasterSize = 128;
 constexpr double kCoverage = 0.03;
 constexpr double kGiPixel = 1073741824.0;
 constexpr int64_t kMinPercentileSeeds = 101;  // One sample per 1% tail with the rank based on n - 1.
@@ -34,8 +41,8 @@ struct Voxel {
 struct ImageCoverage {
     std::vector<std::pair<int, int>> cells;
     int cols = 0, rows = 0;
+    int valid_pixels = 0;
     double cell_load = 0;
-    int area() const { return cols * rows; }
 };
 
 struct SeedRows {
@@ -167,17 +174,26 @@ std::vector<Voxel> make_voxels(const double* xyz, const SeedRows& seeds, const d
 
 ImageCoverage rasterize(const FrameView& view, const std::vector<Voxel>& voxels, double size,
                         std::vector<int>& counts, const std::atomic<bool>* cancel,
+                        const LccRasterMask* mask,
                         std::vector<int>* pixel_voxel = nullptr) {
     const int w = view.cam.width, h = view.cam.height;
     ImageCoverage result;
-    if (w <= 0 || h <= 0) return result;
-    const double scale = double(kRasterSize) / std::max(w, h);
-    const int cols = result.cols = std::clamp((int)std::ceil(w * scale), 1, kRasterSize);
-    const int rows = result.rows = std::clamp((int)std::ceil(h * scale), 1, kRasterSize);
-    result.cell_load = 1.15 * double(w) * h / (kGiPixel * result.area());
+    const auto [cols, rows] = lcc_raster_dimensions(w, h);
+    if (cols == 0) return result;
+    result.cols = cols;
+    result.rows = rows;
+    const int area = cols * rows;
+    result.valid_pixels = mask ? (int)mask->count() : area;
+    if (result.valid_pixels == 0) {
+        if (pixel_voxel) pixel_voxel->assign((size_t)area, -1);
+        return result;
+    }
+    // A kept raster cell represents the same number of source pixels regardless of the mask.
+    result.cell_load = 1.15 * double(w) * h / (kGiPixel * area);
+    const double scale = double(kLccRasterSize) / std::max(w, h);
     const double focal = std::max(std::abs(view.cam.fx), std::abs(view.cam.fy));
     const bool wrap = camhost::full_longitude(view.cam);
-    std::vector<double> depth((size_t)result.area(), std::numeric_limits<double>::infinity());
+    std::vector<double> depth((size_t)area, std::numeric_limits<double>::infinity());
     std::vector<int> owner(depth.size(), -1);
     for (size_t i = 0; i < voxels.size(); ++i) {
         if (i % 4096 == 0 && cancel && cancel->load(std::memory_order_relaxed)) return {};
@@ -193,6 +209,7 @@ ImageCoverage rasterize(const FrameView& view, const std::vector<Voxel>& voxels,
             for (int col = x0; col <= x1; ++col) {
                 const int px = wrap ? (col % cols + cols) % cols : col;
                 const size_t at = (size_t)row * cols + px;
+                if (mask && !(*mask)[at]) continue;
                 const double dx = col + 0.5 - u, dy = row + 0.5 - v;
                 if (distance < depth[at] &&
                     ((row == y && col == x) || dx * dx + dy * dy <= radius * radius)) {
@@ -416,9 +433,9 @@ std::vector<std::vector<int>> assign_training_data(const ParsedDataset& ds, cons
         if (image.cells.empty()) continue;
         count_part_pixels(image, in_voxel, coverage);
         const auto primary = std::max_element(coverage.begin(), coverage.end());
-        if (*primary > kCoverage * image.area()) p.frame_label[c] = (int32_t)(primary - coverage.begin());
+        if (*primary > kCoverage * image.valid_pixels) p.frame_label[c] = (int32_t)(primary - coverage.begin());
         for (size_t k = 0; k < n; ++k) {
-            const double share = double(coverage[k]) / image.area();
+            const double share = double(coverage[k]) / image.valid_pixels;
             if (share > best_share[k]) {
                 best_share[k] = share;
                 best_frame[k] = (int)c;
@@ -452,6 +469,7 @@ std::vector<std::vector<int>> assign_training_data(const ParsedDataset& ds, cons
 struct LccProjectionDebug::Data {
     std::vector<Voxel> voxels;
     std::vector<std::vector<int>> voxel_parts;
+    LccProjectionMasks masks;
     double voxel_size;
     int num_parts;
 };
@@ -462,11 +480,14 @@ LccFrameProjection LccProjectionDebug::project(const ParsedDataset& ds, int64_t 
     check_cancel(cancel);
     LccFrameProjection frame;
     std::vector<int> counts(_data->voxels.size(), 0);
+    const auto& masks = _data->masks.frames;
+    const auto* mask = masks.empty() ? nullptr : masks[(size_t)camera].get();
     const ImageCoverage image = rasterize(frame_view(ds, camera), _data->voxels, _data->voxel_size,
-                                          counts, cancel, &frame.pixel_voxel);
+                                          counts, cancel, mask, &frame.pixel_voxel);
     check_cancel(cancel);
     frame.width = image.cols;
     frame.height = image.rows;
+    frame.valid_pixels = image.valid_pixels;
     frame.part_pixels.resize((size_t)_data->num_parts);
     count_part_pixels(image, _data->voxel_parts, frame.part_pixels);
     return frame;
@@ -511,7 +532,7 @@ const std::vector<double>& LccLidarCache::sample(const ParsedDataset& ds, const 
 
 void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePartition& p,
                    const PartitionLog& log, const std::atomic<bool>* cancel,
-                   LccLidarCache* lidar_cache, LccProjectionDebug* projection) {
+                   LccLidarCache* lidar_cache, LccProjectionDebug* projection, const LccProjectionMasks* masks) {
     const PartitionOptions& opt = p.options;
     const bool use_lidar = !opt.lcc_lidar_cloud.empty();
     if (opt.parts != 0 || opt.max_projected_points < 1 || !std::isfinite(opt.lcc_gpixels) ||
@@ -542,6 +563,8 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
             throw std::runtime_error("partition: LCC track filtering removed all seed points");
     }
     const size_t n = (size_t)ds.num_cameras;
+    const bool masked = masks && !masks->frames.empty();
+    if (masked && masks->frames.size() != n) throw std::runtime_error("partition: LCC mask count mismatch");
     if (ds.image_filenames.size() != n || ds.widths.size() != n || ds.heights.size() != n || ds.intrins.size() != 4 * n ||
         ds.c2w.size() != 12 * n || (!ds.camera_models.empty() && ds.camera_models.size() != n) ||
         (!ds.camera_distortions.empty() && ds.camera_distortions.size() != n) ||
@@ -575,10 +598,14 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
 #pragma omp for schedule(dynamic, 4)
         for (int64_t i = 0; i < ds.num_cameras; ++i) {
             if (cancel && cancel->load(std::memory_order_relaxed)) continue;
-            images[(size_t)i] = rasterize(frame_view(ds, i), voxels, size, counts, cancel);
+            const auto* mask = masked ? masks->frames[(size_t)i].get() : nullptr;
+            images[(size_t)i] = rasterize(frame_view(ds, i), voxels, size, counts, cancel, mask);
         }
     }
     check_cancel(cancel);
+    if (masked && std::none_of(images.begin(), images.end(),
+                               [](const ImageCoverage& image) { return image.valid_pixels > 0; }))
+        throw std::runtime_error("partition: LCC masks exclude all image pixels");
     SpatialPart root;
     root.core = bounds;
     for (int axis = 0; axis < 3; ++axis) {
@@ -621,7 +648,8 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
                 std::to_string(p.spatial_parts[(size_t)k].gpixels) + " GPixels");
     if (projection)
         projection->_data = std::make_shared<LccProjectionDebug::Data>(
-            LccProjectionDebug::Data{std::move(voxels), std::move(voxel_parts), size, p.num_parts});
+            LccProjectionDebug::Data{std::move(voxels), std::move(voxel_parts),
+                                    masked ? *masks : LccProjectionMasks{}, size, p.num_parts});
 }
 
 }  // namespace spirula

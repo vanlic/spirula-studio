@@ -38,7 +38,8 @@ public:
     PartitionPanel();
     ~PartitionPanel();
 
-    void open(const std::string& dataset_dir, Hooks hooks);
+    void open(const std::string& dataset_dir, const std::string& image_dir, const std::string& mask_dir,
+              bool mask_flipped, Hooks hooks);
     bool is_open() const { return _open; }
     void close();
     void set_lidar_cloud(const std::string& path);
@@ -68,6 +69,8 @@ private:
 
     bool _open = false;
     std::string _dataset;
+    DatasetParserConfig _parser;
+    bool _mask_flipped = false;
     Hooks _hooks;
 
     // ---- worker ----

@@ -7989,7 +7989,7 @@ void GuiApp::open_partition_panel(const DatasetFolders& f) {
     hooks.open_batch = [this] {
         if (!native_work_busy()) _screen = Screen::Batch;
     };
-    _partition_panel.open(f.dir, std::move(hooks));
+    _partition_panel.open(f.dir, f.image_dir, f.mask_dir, f.mask_flipped, std::move(hooks));
 }
 
 void GuiApp::open_roi_editor(const std::string& dataset, const std::string& file) {

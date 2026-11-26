@@ -3,6 +3,7 @@
 #include "data/ScenePartition.h"
 
 #include <array>
+#include <bitset>
 #include <filesystem>
 
 namespace spirula {
@@ -27,9 +28,19 @@ private:
 
 struct LccFrameProjection {
     int width = 0, height = 0;
+    int valid_pixels = 0;
     std::vector<int> pixel_voxel;  // Row-major, -1 for background.
     std::vector<int> part_pixels;
 };
+
+constexpr int kLccRasterSize = 128;
+using LccRasterMask = std::bitset<kLccRasterSize * kLccRasterSize>;
+
+struct LccProjectionMasks {
+    std::vector<std::shared_ptr<const LccRasterMask>> frames;
+};
+
+std::array<int, 2> lcc_raster_dimensions(int width, int height);
 
 class LccProjectionDebug {
 public:
@@ -42,11 +53,12 @@ private:
     struct Data;
     std::shared_ptr<const Data> _data;
     friend void partition_lcc(const ParsedDataset&, const SparseStats*, ScenePartition&,
-                              const PartitionLog&, const std::atomic<bool>*, LccLidarCache*, LccProjectionDebug*);
+                              const PartitionLog&, const std::atomic<bool>*, LccLidarCache*,
+                              LccProjectionDebug*, const LccProjectionMasks*);
 };
 
 void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePartition& part,
                    const PartitionLog& log, const std::atomic<bool>* cancel,
-                   LccLidarCache* lidar_cache, LccProjectionDebug* projection);
+                   LccLidarCache* lidar_cache, LccProjectionDebug* projection, const LccProjectionMasks* masks);
 
 }  // namespace spirula

@@ -101,7 +101,8 @@ MaskShape shrink_border(MaskShape shape, float shrink);
 // Reads `samples` frames spread across `files` and fits the boundary of the
 // image circle. `files` is one camera's frames, in capture order.
 BorderDetect detect_fisheye_border(const std::vector<std::string>& files,
-                                   const BorderDetectOptions& o);
+                                   const BorderDetectOptions& o, bool apply_exif = true,
+                                   const std::atomic<bool>* cancel = nullptr);
 
 // The same, for a caller that produces frames itself. Holding 24 frames of a
 // 360 camera would be 265 MB, so they are folded in one at a time; `add`

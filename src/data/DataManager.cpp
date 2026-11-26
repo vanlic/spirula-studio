@@ -10,6 +10,7 @@
 #include "core/TiffImage.h"
 #include "data/DownscaleCache.h"
 #include "data/ImageProbe.h"
+#include "data/MaskDecode.h"
 #include "data/ResolutionSchedule.h"
 #include "data/SourceCamera.h"
 #include "i18n/catalog/Data.h"
@@ -39,6 +40,7 @@
 
 namespace dmsg = spirula::i18n::msg::data;
 using spirula::i18n::format;
+using spirula::decode_mask_into;
 
 // ===========================================================================
 // Small utilities
@@ -534,12 +536,16 @@ void apply_boundary_offset(uint8_t* mask, int h, int w, float fraction) {
     edt::apply_mask_boundary_offset_in_place(mask, h, w, offset_px);
 }
 
+}  // namespace
+
+namespace spirula {
+
 void decode_mask_into(const std::string& path,
                       int dst_h, int dst_w,
                       bool flip,
                       float boundary_offset_frac,
                       uint8_t* dst,
-                      int turns_cw = 0)
+                      int turns_cw)
 {
     int w, h, ch;
     stbi_uc* img = stbi_load(path.c_str(), &w, &h, &ch, 1);
@@ -566,6 +572,10 @@ void decode_mask_into(const std::string& path,
 
     apply_boundary_offset(dst, dst_h, dst_w, boundary_offset_frac);
 }
+
+}  // namespace spirula
+
+namespace {
 
 // cpu_area_resize with colour weighted by the last channel, alpha: compositing
 // the result over a colour equals filtering the composite.
