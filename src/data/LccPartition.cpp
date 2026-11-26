@@ -1,5 +1,6 @@
 #include "data/LccPartition.h"
 
+#include "data/PointCloudFile.h"
 #include "data/RegionMesh.h"
 #include "data/SceneProjection.h"
 
@@ -9,6 +10,7 @@
 #include <limits>
 #include <map>
 #include <queue>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -20,6 +22,8 @@ constexpr int kRasterSize = 128;
 constexpr double kCoverage = 0.03;
 constexpr double kGiPixel = 1073741824.0;
 constexpr int64_t kMinPercentileSeeds = 101;  // One sample per 1% tail with the rank based on n - 1.
+constexpr double kLidarLasFraction = 0.03;
+constexpr double kLidarPlyFraction = 0.2;
 
 struct Voxel {
     std::array<double, 3> center;
@@ -43,21 +47,99 @@ void check_cancel(const std::atomic<bool>* cancel) {
     if (cancel && cancel->load(std::memory_order_relaxed)) throw PartitionCancelled();
 }
 
-std::vector<Voxel> make_voxels(const ParsedDataset& ds, const SeedRows& seeds, const Aabb& bounds,
+std::vector<double> sample_lidar(const ParsedDataset& ds, const PartitionOptions& opt,
+                                 const PartitionLog& log, const std::atomic<bool>* cancel) {
+    check_cancel(cancel);
+    cloud::Reader reader(opt.lcc_lidar_cloud);
+    const double fraction = opt.lcc_lidar_sample_fraction > 0 ? opt.lcc_lidar_sample_fraction :
+        (reader.info().format == cloud::Format::Ply ? kLidarPlyFraction : kLidarLasFraction);
+    const uint64_t limit = (uint64_t)opt.max_projected_points;
+    uint64_t pcg_state = 0x853c49e6748fea9bULL;
+    std::mt19937_64 reservoir(42);
+    uint64_t selected = 0, valid = 0;
+    std::vector<double> xyz;
+    xyz.reserve((size_t)std::min<uint64_t>(limit, std::max<int64_t>(0, reader.info().points)) * 3);
+    const bool finished = reader.read([&](const e57::Point* points, size_t n) {
+        for (size_t i = 0; i < n; ++i) {
+            if (i % 4096 == 0) check_cancel(cancel);
+            const double q[] = {points[i].xyz[0] - ds.center[0], points[i].xyz[1] - ds.center[1],
+                                points[i].xyz[2] - ds.center[2]};
+            if (!std::all_of(q, q + 3, [](double v) { return std::isfinite(v); })) continue;
+            ++valid;
+            const uint64_t old = pcg_state;
+            pcg_state = old * 0x5851f42d4c957f2dULL + 0xda3e39cb94b95bdbULL;
+            const uint32_t bits = (uint32_t)(((old >> 18) ^ old) >> 27);
+            const unsigned rot = (unsigned)(old >> 59);
+            const uint32_t draw = (bits >> rot) | (bits << ((32 - rot) % 32));
+            if ((double)draw / 4294967296.0 >= fraction) continue;
+            ++selected;
+            if (selected <= limit) xyz.insert(xyz.end(), q, q + 3);
+            else {
+                const uint64_t row = std::uniform_int_distribution<uint64_t>(0, selected - 1)(reservoir);
+                if (row < limit) std::copy(q, q + 3, xyz.data() + (size_t)row * 3);
+            }
+        }
+    }, cancel);
+    if (!finished) throw PartitionCancelled();
+    if (xyz.empty()) throw std::runtime_error("partition: no LiDAR points sampled; check the scan or raise the sample fraction");
+    if (log) log("LCC: sampled " + std::to_string(xyz.size() / 3) + " of " + std::to_string(valid) +
+                 " LiDAR points for voxelization");
+    return xyz;
+}
+
+Aabb bound_points(const double* xyz, SeedRows& rows, bool robust, const char* name,
+                  const PartitionLog& log, const std::atomic<bool>* cancel) {
+    Aabb bounds;
+    for (int64_t i = 0; i < rows.count; ++i) {
+        if (i % 4096 == 0) check_cancel(cancel);
+        const double* q = &xyz[(size_t)rows[i] * 3];
+        if (!std::all_of(q, q + 3, [](double v) { return std::isfinite(v); }))
+            throw std::runtime_error("partition: LCC requires finite point coordinates");
+        bounds.expand(q);
+    }
+    if (!robust || rows.count == 0) return bounds;
+    if (rows.count < kMinPercentileSeeds) {
+        if (log) log(std::string("LCC: robust bounds kept all ") + name + " in a cloud with fewer than 101 points");
+        return bounds;
+    }
+
+    check_cancel(cancel);
+    const Aabb clip = robust_bounds(xyz, rows.count, rows.kept.empty() ? nullptr : rows.kept.data());
+    SeedRows clipped{0, {}};
+    clipped.kept.reserve((size_t)rows.count);
+    bounds = {};
+    for (int64_t i = 0; i < rows.count; ++i) {
+        if (i % 4096 == 0) check_cancel(cancel);
+        const int64_t row = rows[i];
+        const double* q = &xyz[(size_t)row * 3];
+        if (!clip.contains(q)) continue;
+        clipped.kept.push_back(row);
+        bounds.expand(q);
+    }
+    clipped.count = (int64_t)clipped.kept.size();
+    if (log) log("LCC: kept " + std::to_string(clipped.count) + " of " + std::to_string(rows.count) +
+                 " " + name + " within robust bounds");
+    if (clipped.count == 0)
+        throw std::runtime_error(std::string("partition: LCC robust bounds removed all ") + name);
+    rows = std::move(clipped);
+    return bounds;
+}
+
+std::vector<Voxel> make_voxels(const double* xyz, const SeedRows& seeds, const double origin[3],
                               double size, int limit, const std::atomic<bool>* cancel) {
     const int64_t stride = 1 + (seeds.count - 1) / limit;
     std::map<std::array<int64_t, 3>, Voxel> grid;
     for (int64_t i = 0; i < seeds.count; i += stride) {
         if ((i / stride) % 4096 == 0) check_cancel(cancel);
-        const double* q = &ds.points.xyz[(size_t)seeds[i] * 3];
+        const double* q = &xyz[(size_t)seeds[i] * 3];
         std::array<int64_t, 3> cell;
         Voxel voxel;
         for (int axis = 0; axis < 3; ++axis) {
-            const double coordinate = (q[axis] - bounds.lo[axis]) / size;
-            if (coordinate >= double(int64_t(1) << 62))
+            const double coordinate = (q[axis] - origin[axis]) / size;
+            if (std::abs(coordinate) >= double(int64_t(1) << 62))
                 throw std::runtime_error("partition: voxel size is too small for the scene");
-            cell[axis] = (int64_t)coordinate;
-            voxel.center[axis] = bounds.lo[axis] + (double(cell[axis]) + 0.5) * size;
+            cell[axis] = (int64_t)std::floor(coordinate);
+            voxel.center[axis] = origin[axis] + (double(cell[axis]) + 0.5) * size;
         }
         grid.try_emplace(cell, voxel);
     }
@@ -346,11 +428,15 @@ void assign_training_data(const ParsedDataset& ds, const SeedRows& seeds, const 
 void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePartition& p,
                    const PartitionLog& log, const std::atomic<bool>* cancel) {
     const PartitionOptions& opt = p.options;
+    const bool use_lidar = !opt.lcc_lidar_cloud.empty();
     if (opt.parts != 0 || opt.max_projected_points < 1 || !std::isfinite(opt.lcc_gpixels) ||
         opt.lcc_gpixels <= 0 || !std::isfinite(opt.lcc_voxel_size) || opt.lcc_voxel_size < 0 ||
         !std::isfinite(opt.lcc_overlap) || opt.lcc_overlap < 0)
         throw std::runtime_error("partition: invalid LCC pixel budget, voxel size, overlap or part count");
-    if (ds.points.num() == 0)
+    if (use_lidar && (!std::isfinite(opt.lcc_lidar_sample_fraction) || opt.lcc_lidar_sample_fraction < 0 ||
+                      opt.lcc_lidar_sample_fraction > 1))
+        throw std::runtime_error("partition: LCC LiDAR sample fraction must be between 0 and 1");
+    if (!use_lidar && ds.points.num() == 0)
         throw std::runtime_error("partition: LCC needs a seed point cloud");
     if (opt.lcc_min_track_length < 0)
         throw std::runtime_error("partition: LCC minimum track length must be nonnegative");
@@ -376,44 +462,24 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
         (!ds.camera_distortions.empty() && ds.camera_distortions.size() != n) ||
         (!ds.dist_coeffs.empty() && ds.dist_coeffs.size() != 8 * n))
         throw std::runtime_error("partition: LCC needs calibrated cameras");
-    Aabb bounds;
-    for (int64_t i = 0; i < seeds.count; ++i) {
-        if (i % 4096 == 0) check_cancel(cancel);
-        const double* q = &ds.points.xyz[(size_t)seeds[i] * 3];
-        if (!std::all_of(q, q + 3, [](double v) { return std::isfinite(v); }))
-            throw std::runtime_error("partition: LCC requires finite point coordinates");
-        bounds.expand(q);
-    }
-    if (opt.lcc_robust_bounds && seeds.count >= kMinPercentileSeeds) {
-        check_cancel(cancel);
-        const Aabb clip = robust_bounds(ds.points.xyz.data(), seeds.count,
-                                       seeds.kept.empty() ? nullptr : seeds.kept.data());
-        SeedRows clipped{0, {}};
-        clipped.kept.reserve((size_t)seeds.count);
-        bounds = {};
-        for (int64_t i = 0; i < seeds.count; ++i) {
-            if (i % 4096 == 0) check_cancel(cancel);
-            const int64_t row = seeds[i];
-            const double* q = &ds.points.xyz[(size_t)row * 3];
-            if (!clip.contains(q)) continue;
-            clipped.kept.push_back(row);
-            bounds.expand(q);
-        }
-        clipped.count = (int64_t)clipped.kept.size();
-        if (log) log("LCC: kept " + std::to_string(clipped.count) + " of " +
-                     std::to_string(seeds.count) + " seed points within robust bounds");
-        if (clipped.count == 0)
-            throw std::runtime_error("partition: LCC robust bounds removed all seed points");
-        seeds = std::move(clipped);
-    } else if (opt.lcc_robust_bounds && log) {
-        log("LCC: robust bounds kept all points in a cloud with fewer than 101 seeds");
+    Aabb bounds = bound_points(ds.points.xyz.data(), seeds, opt.lcc_robust_bounds,
+                               "seed points", log, cancel);
+    SeedRows lidar_rows{0, {}};
+    std::vector<double> lidar;
+    if (use_lidar) {
+        lidar = sample_lidar(ds, opt, log, cancel);
+        lidar_rows.count = (int64_t)(lidar.size() / 3);
+        bounds = bound_points(lidar.data(), lidar_rows, opt.lcc_robust_bounds, "LiDAR points", log, cancel);
     }
     const double extent = std::max({bounds.hi[0] - bounds.lo[0], bounds.hi[1] - bounds.lo[1],
                                     bounds.hi[2] - bounds.lo[2]});
     const double size = opt.lcc_voxel_size > 0 ? opt.lcc_voxel_size : extent / 256.0;
     if (!(size > 0) || !std::isfinite(extent) || !std::isfinite(extent + size))
         throw std::runtime_error("partition: LCC cannot determine a voxel size for this cloud");
-    std::vector<Voxel> voxels = make_voxels(ds, seeds, bounds, size, opt.max_projected_points, cancel);
+    const double centered_origin[3] = {0, 0, 0};
+    std::vector<Voxel> voxels = use_lidar
+        ? make_voxels(lidar.data(), lidar_rows, centered_origin, size, opt.max_projected_points, cancel)
+        : make_voxels(ds.points.xyz.data(), seeds, bounds.lo, size, opt.max_projected_points, cancel);
     std::vector<ImageCoverage> images(n);
     if (log) log("LCC: projecting " + std::to_string(voxels.size()) + " voxels");
 #pragma omp parallel
@@ -441,7 +507,9 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
             root.gpixels += load;
         }
     }
-    if (root.gpixels <= 0) throw std::runtime_error("partition: LCC found no visible seed geometry");
+    if (root.gpixels <= 0)
+        throw std::runtime_error(use_lidar ? "partition: no sampled LiDAR points are visible; check scan alignment and sampling"
+                                           : "partition: LCC found no visible seed geometry");
     const auto heaviest = std::max_element(voxels.begin(), voxels.end(),
         [](const Voxel& a, const Voxel& b) { return a.load < b.load; });
     if (heaviest->load > opt.lcc_gpixels) {

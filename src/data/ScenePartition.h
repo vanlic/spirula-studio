@@ -54,6 +54,8 @@ struct PartitionOptions {
     double lcc_overlap = 0.0;
     int lcc_min_track_length = 0;
     bool lcc_robust_bounds = false;
+    std::string lcc_lidar_cloud;
+    double lcc_lidar_sample_fraction = 0.0;
 };
 
 // Projection rows are shared by nearby file-order points to bound observer storage.

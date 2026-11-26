@@ -3171,7 +3171,8 @@ const char* GuiApp::dir_key(PickAction a, FileDialog::Mode m) {
         case PickAction::StencilFile:       return "stencil";
         case PickAction::SourceLut:         return "lut";
         case PickAction::SeedPointcloud:    return "seed_pointcloud";
-        case PickAction::LidarSource:       return "lidar";
+        case PickAction::LidarSource:
+        case PickAction::PartitionLidar:    return "lidar";
         case PickAction::ResumeRun:         return "train.resume";   // shared with the field's own picker
         case PickAction::RenderProjectSave:
         case PickAction::RenderProjectOpen: return "render_project";
@@ -3293,6 +3294,9 @@ void GuiApp::handle_dialog_result(const std::vector<std::string>& paths) {
             _cfg.seed_pointcloud = path;
             _cfg_ui.touched.insert("seed_pointcloud");
             _parse_dirty = true;
+            break;
+        case PickAction::PartitionLidar:
+            _partition_panel.set_lidar_cloud(path);
             break;
         case PickAction::ConfigPath: {
             const TrainConfig before = _cfg;
@@ -7974,6 +7978,10 @@ void GuiApp::open_partition_panel(const DatasetFolders& f) {
     PartitionPanel::Hooks hooks;
     hooks.log = [this](const std::string& s) { log(s); };
     hooks.open_splat = [this](const std::string& path) { request_open_splat(path); };
+    hooks.pick_lidar = [this] {
+        open_pick(PickAction::PartitionLidar, spirula::i18n::msg::partition::lbl_lcc_lidar.get(),
+                  FileDialog::Mode::File, {".e57", ".las", ".laz", ".ply"});
+    };
     hooks.queue_batch = [this, f](const std::string& partition, int n) {
         open_partition_queue(f, partition, n);
         return 0;

@@ -27,6 +27,7 @@ public:
         // Queue one training run per part of the saved partition file.
         std::function<int(const std::string& partition_json, int num_parts)> queue_batch;
         std::function<void(const std::string& path)> open_splat;
+        std::function<void()> pick_lidar;
         std::function<void()> open_batch;
         std::function<void(const std::string& line)> log;
     };
@@ -37,6 +38,7 @@ public:
     void open(const std::string& dataset_dir, Hooks hooks);
     bool is_open() const { return _open; }
     void close();
+    void set_lidar_cloud(const std::string& path);
     // Once per frame from the dataset screen.
     void draw();
     void destroy_gl();

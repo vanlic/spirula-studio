@@ -196,6 +196,50 @@ SS_MSG(lbl_gpixels,
     RU("GPixels на блок"),
     TR("Blok başına GPixels"));
 
+SS_MSG(lbl_lcc_lidar,
+    EN("LiDAR point cloud"), JA("LiDAR 点群"), ZH_HANS("激光雷达点云"),
+    ZH_HANT("雷射雷達點雲"), KO("라이다 포인트 클라우드"), DE("LiDAR-Punktwolke"),
+    FR("Nuage de points LiDAR"), ES("Nube de puntos LiDAR"), PT("Nuvem de pontos LiDAR"),
+    IT("Nuvola di punti LiDAR"), NL("LiDAR-puntenwolk"), RU("Облако точек LiDAR"),
+    TR("LiDAR nokta bulutu"));
+
+SS_MSG(opt_lcc_lidar,
+    EN("Choose a scan aligned to the dataset. Leave blank to use dataset points for partitioning."),
+    JA("データセットに整列したスキャンを選びます。空欄ならデータセットの点で分割します。"),
+    ZH_HANS("选择已对齐到数据集的点云。留空时用数据集点云分区。"),
+    ZH_HANT("選擇已對齊到資料集的點雲。留空時用資料集點雲分區。"),
+    KO("데이터셋에 정렬된 스캔을 선택합니다. 비워 두면 데이터셋의 점으로 분할합니다."),
+    DE("Scan im Datensatz-Koordinatensystem wählen. Leer nutzt Datensatzpunkte."),
+    FR("Choisir un scan aligné sur le jeu de données. Vide, utilise les points du jeu."),
+    ES("Elige un escaneo alineado con el conjunto. Si se deja vacío, se usan sus puntos."),
+    PT("Escolha uma varredura alinhada ao conjunto. Em branco, usa os pontos do conjunto."),
+    IT("Scegli una scansione allineata al dataset. Vuoto usa i punti del dataset."),
+    NL("Kies een scan uitgelijnd op de dataset. Leeg gebruikt datasetpunten."),
+    RU("Выберите скан в системе координат набора. Пусто — использовать точки набора."),
+    TR("Veri kümesine hizalı bir tarama seçin. Boşsa veri kümesinin noktaları kullanılır."));
+
+SS_MSG(lbl_lcc_lidar_sample,
+    EN("LiDAR sample fraction"), JA("LiDAR 点の抽出率"), ZH_HANS("激光点采样比例"),
+    ZH_HANT("雷射點取樣比例"), KO("라이다 샘플링 비율"), DE("LiDAR-Stichprobenanteil"),
+    FR("Fraction LiDAR échantillonnée"), ES("Fracción de muestreo LiDAR"),
+    PT("Fração de amostragem LiDAR"), IT("Frazione di campionamento LiDAR"),
+    NL("LiDAR-steekproeffractie"), RU("Доля точек LiDAR"), TR("LiDAR örnekleme oranı"));
+
+SS_MSG(opt_lcc_lidar_sample,
+    EN("0 uses 20% for PLY and 3% for other scans. 1 uses the full scan up to the projection limit."),
+    JA("0 は PLY を 20%、他を 3% 抽出します。1 は投影上限まで全点を使います。"),
+    ZH_HANS("0 为自动，PLY 取 20%，其他格式取 3%。1 使用全量，受投影点数上限限制。"),
+    ZH_HANT("0 為自動，PLY 取 20%，其他格式取 3%。1 使用全量，受投影點數上限限制。"),
+    KO("0은 PLY 20%, 그 외 3%입니다. 1은 투영 한도까지 모든 점을 사용합니다."),
+    DE("0 nutzt 20 % bei PLY und 3 % sonst. 1 nutzt alle Punkte bis zur Projektionsgrenze."),
+    FR("0 prend 20 % des PLY et 3 % des autres scans. 1 prend tout jusqu’à la limite de projection."),
+    ES("0 toma el 20 % de PLY y el 3 % de los demás. 1 toma todo hasta el límite de proyección."),
+    PT("0 usa 20% de PLY e 3% dos demais. 1 usa todos os pontos até o limite de projeção."),
+    IT("0 usa il 20% per PLY e il 3% per gli altri. 1 usa tutto fino al limite di proiezione."),
+    NL("0 gebruikt 20% voor PLY en 3% voor andere scans. 1 gebruikt alles tot de projectielimiet."),
+    RU("0 берёт 20% из PLY и 3% из других форматов. 1 берёт все точки до лимита проекции."),
+    TR("0, PLY için %20, diğerleri için %3 alır. 1, izdüşüm sınırına kadar tüm noktaları alır."));
+
 SS_MSG(lbl_lcc_voxel,
     EN("Voxel size"),
     JA("ボクセルサイズ"),

@@ -935,6 +935,8 @@ ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
     if (opt.method != PartitionMethod::Lcc) {
         p.options.lcc_min_track_length = 0;
         p.options.lcc_robust_bounds = false;
+        p.options.lcc_lidar_cloud.clear();
+        p.options.lcc_lidar_sample_fraction = 0.0;
     }
     p.source = cov.source;
     p.frame_names = FrameIndex(ds.image_filenames).unique_tails();
@@ -1613,6 +1615,10 @@ void write_partition(const ScenePartition& p, const std::string& json_path,
         w.field_raw("lcc_overlap", json_number_exact(p.options.lcc_overlap));
         w.field("lcc_min_track_length", p.options.lcc_min_track_length);
         w.field("lcc_robust_bounds", p.options.lcc_robust_bounds);
+        if (!p.options.lcc_lidar_cloud.empty()) {
+            w.field("lcc_lidar_cloud", p.options.lcc_lidar_cloud);
+            w.field_raw("lcc_lidar_sample_fraction", json_number_exact(p.options.lcc_lidar_sample_fraction));
+        }
     }
     w.end();
     w.field("num_parts", p.num_parts);
@@ -1682,6 +1688,9 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
         p.options.lcc_overlap = o->get_double("lcc_overlap", p.options.lcc_overlap);
         if (const JsonValue* robust = o->find("lcc_robust_bounds"))
             p.options.lcc_robust_bounds = robust->as_bool();
+        if (const JsonValue* cloud = o->find("lcc_lidar_cloud"))
+            p.options.lcc_lidar_cloud = cloud->as_string();
+        p.options.lcc_lidar_sample_fraction = o->get_double("lcc_lidar_sample_fraction", 0.0);
         if (const JsonValue* threshold = o->find("lcc_min_track_length")) {
             const double value = threshold->as_double(-1);
             if (value < 0 || value > std::numeric_limits<int>::max() || std::floor(value) != value)

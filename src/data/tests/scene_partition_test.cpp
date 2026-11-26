@@ -32,6 +32,7 @@
 #include <exception>
 #include <limits>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -388,6 +389,59 @@ void check_lcc_robust_bounds() {
           "LCC robust bounds do not clip a percentile from a tiny cloud");
 }
 
+void check_lcc_lidar_partition() {
+    using namespace spirula;
+    ParsedDataset ds = make_corridor(14, 4, 5).ds;
+    ds.center = {1200.0, -2300.0, 50.0};
+    const fs::path cloud = fs::temp_directory_path() / "spirula_lcc_lidar_test.ply";
+    std::ostringstream ply;
+    constexpr int n = 137 * 25 * 2;
+    ply << "ply\nformat ascii 1.0\nelement vertex " << n
+        << "\nproperty double x\nproperty double y\nproperty double z\nend_header\n";
+    for (int x = -16; x <= 120; ++x)
+        for (int y = -12; y <= 12; ++y)
+            for (double z : {-0.5, 2.0})
+                ply << ds.center[0] + x * 0.125 << ' ' << ds.center[1] + y * 0.125 << ' '
+                    << ds.center[2] + z << '\n';
+    write_text(cloud, ply.str());
+    PartitionOptions opt;
+    opt.method = PartitionMethod::Lcc;
+    opt.lcc_voxel_size = 0.125;
+    opt.lcc_gpixels = 100;
+    const Covisibility cov = build_covisibility(ds, nullptr, opt);
+    const auto sparse = partition_scene(ds, cov, opt);
+    opt.lcc_lidar_cloud = cloud.u8string();
+    std::vector<std::string> logs;
+    ParsedDataset cameras = ds;
+    cameras.points = {};
+    const auto lidar_only = partition_scene(cameras, cov, opt, [&](const std::string& line) { logs.push_back(line); });
+    check(lidar_only.point_label.empty() && lidar_only.spatial_parts[0].gpixels > 0 &&
+              std::find(logs.begin(), logs.end(), "LCC: sampled 1314 of 6850 LiDAR points for voxelization") != logs.end(),
+          "LCC uses its deterministic PLY sample with a camera-only dataset");
+    opt.max_projected_points = 200;
+    logs.clear();
+    const auto lidar = partition_scene(ds, cov, opt, [&](const std::string& line) { logs.push_back(line); });
+    check(lidar.num_parts == 1 && lidar.spatial_parts[0].core.hi[2] == 52.0625 &&
+              sparse.spatial_parts[0].core.hi[2] < 51.0 &&
+              std::find(logs.begin(), logs.end(), "LCC: sampled 200 of 6850 LiDAR points for voxelization") != logs.end(),
+          "LCC projects a capped sample of the aligned LiDAR cloud");
+    const fs::path file = fs::temp_directory_path() / "spirula_lcc_lidar_test.json";
+    opt.lcc_lidar_sample_fraction = 0.75;
+    const auto custom = partition_scene(ds, cov, opt);
+    write_partition(custom, file.u8string(), "corridor");
+    fs::remove(cloud);
+    const auto loaded = read_partition(file.u8string());
+    PartitionApplied applied;
+    const auto points = ds.points.xyz;
+    check(loaded.options.lcc_lidar_cloud == opt.lcc_lidar_cloud &&
+              loaded.options.lcc_lidar_sample_fraction == opt.lcc_lidar_sample_fraction &&
+              loaded.point_label.size() == (size_t)ds.points.num() && apply_partition(ds, loaded, 0, applied) &&
+              ds.points.xyz == points,
+          "LCC saves the LiDAR options and applies the original training seed table without the scan");
+    fs::remove(file);
+    fs::remove(fs::path(file).replace_extension(".bin"));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -397,6 +451,7 @@ int main(int argc, char** argv) {
         check_lcc_tight_budget();
         check_lcc_track_filter();
         check_lcc_robust_bounds();
+        check_lcc_lidar_partition();
         return g_failures != 0;
     }
     if (argc == 4 && std::string(argv[1]) == "--camera-metadata") {
@@ -463,6 +518,7 @@ int main(int argc, char** argv) {
     check_lcc_tight_budget();
     check_lcc_track_filter();
     check_lcc_robust_bounds();
+    check_lcc_lidar_partition();
     const Corridor corr = make_corridor(60, 40, 5);
     const ParsedDataset& ds = corr.ds;
 

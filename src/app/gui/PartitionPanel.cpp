@@ -8,6 +8,7 @@
 #include "app/gui/Ui.h"
 #include "checkpoint/SplatMerge.h"
 #include "checkpoint/SplatPly.h"
+#include "i18n/catalog/Dataset.h"
 #include "i18n/catalog/Gui.h"
 #include "i18n/catalog/Partition.h"
 
@@ -20,6 +21,7 @@
 #include <filesystem>
 
 namespace fs = std::filesystem;
+namespace dmsg = spirula::i18n::msg::dataset;
 namespace gmsg = spirula::i18n::msg::gui;
 namespace pmsg = spirula::i18n::msg::partition;
 
@@ -61,6 +63,8 @@ void PartitionPanel::open(const std::string& dataset_dir, Hooks hooks) {
     if (_worker.joinable()) _worker.join();
     _open = true;
     _dataset = dataset_dir;
+    _opt.lcc_lidar_cloud.clear();
+    _opt.lcc_lidar_sample_fraction = 0.0;
     _hooks = std::move(hooks);
     _loaded = _cov_valid = _part_valid = false;
     _ds = ParsedDataset{};
@@ -93,6 +97,10 @@ void PartitionPanel::close() {
 }
 
 void PartitionPanel::destroy_gl() { _view.destroy_gl(); }
+
+void PartitionPanel::set_lidar_cloud(const std::string& path) {
+    if (_open && !_busy.load() && !path.empty()) _opt.lcc_lidar_cloud = path;
+}
 
 // ---------------------------------------------------------------------------
 // The worker
@@ -156,7 +164,11 @@ void PartitionPanel::run_compute() {
         opt = _compute_opt;
     }
     const bool lcc = opt.method == spirula::PartitionMethod::Lcc;
-    if (lcc) opt.parts = 0;
+    if (lcc) {
+        opt.parts = 0;
+        if (!opt.lcc_lidar_cloud.empty())
+            opt.lcc_lidar_cloud = (fs::u8path(_dataset) / fs::u8path(opt.lcc_lidar_cloud)).lexically_normal().u8string();
+    }
     const bool reuse = !lcc && _cov_valid && _cov_opt.method != spirula::PartitionMethod::Lcc &&
                        _cov_opt.source == opt.source &&
                        (opt.method == spirula::PartitionMethod::Voronoi || _cov.camera_graph_built) &&
@@ -277,6 +289,9 @@ bool PartitionPanel::options_changed() const {
            a.lcc_gpixels != b.lcc_gpixels || a.lcc_voxel_size != b.lcc_voxel_size ||
            a.lcc_overlap != b.lcc_overlap || a.lcc_min_track_length != b.lcc_min_track_length ||
            a.lcc_robust_bounds != b.lcc_robust_bounds ||
+           (b.method == spirula::PartitionMethod::Lcc &&
+            (a.lcc_lidar_cloud != b.lcc_lidar_cloud ||
+             (!b.lcc_lidar_cloud.empty() && a.lcc_lidar_sample_fraction != b.lcc_lidar_sample_fraction))) ||
            a.projection_depth_slack != b.projection_depth_slack ||
            a.proximity_neighbours != b.proximity_neighbours ||
            a.source != b.source;
@@ -443,6 +458,23 @@ void PartitionPanel::draw_controls() {
         ui::help_on_hover(pmsg::opt_method);
     }
     if (_opt.method == spirula::PartitionMethod::Lcc) {
+        ui::Text(pmsg::lbl_lcc_lidar);
+        ui::help_on_hover(pmsg::opt_lcc_lidar);
+        ImGui::SetNextItemWidth(px(150.0f));
+        ui::InputTextRaw("##lcc_lidar_cloud", &_opt.lcc_lidar_cloud);
+        ui::help_on_hover(pmsg::opt_lcc_lidar);
+        if (_hooks.pick_lidar) {
+            ImGui::SameLine();
+            if (ui::Button(dmsg::browse)) _hooks.pick_lidar();
+        }
+        if (!_opt.lcc_lidar_cloud.empty()) {
+            ImGui::SameLine();
+            if (ui::Button(dmsg::remove)) _opt.lcc_lidar_cloud.clear();
+            ImGui::SetNextItemWidth(px(120.0f));
+            if (ui::InputDouble(pmsg::lbl_lcc_lidar_sample, &_opt.lcc_lidar_sample_fraction, "%g"))
+                _opt.lcc_lidar_sample_fraction = std::clamp(_opt.lcc_lidar_sample_fraction, 0.0, 1.0);
+            ui::help_on_hover(pmsg::opt_lcc_lidar_sample);
+        }
         ImGui::SetNextItemWidth(px(120.0f));
         if (ui::InputDouble(pmsg::lbl_gpixels, &_opt.lcc_gpixels, "%g"))
             _opt.lcc_gpixels = std::max(1e-6, _opt.lcc_gpixels);
