@@ -56,10 +56,12 @@ points it leaves the cloud intact, so the 1% tails have symmetric support.
 
 Training uses an expanded box for its seeds and ROI. Images with more than
 3% coarse pixel coverage in the expanded box are shared across blocks as
-needed. A block with lower coverage uses its best visible image. Merging
-keeps splat centres only in each block's half-open core box, so a centre
-on a shared split belongs to the upper child. Boxes and per-block loads
-are saved in partition JSON alongside the usual image and seed tables.
+needed. A block with lower coverage uses its best visible image. During
+merge, the internal split planes define ownership, with a centre on a
+split assigned to the upper child. Faces on the scene's outer boundary
+remain open so the merge can retain geometry beyond the seed cloud.
+Boxes and per-block loads are saved in partition JSON alongside the
+usual image and seed tables.
 
 ### Voronoi partition
 
@@ -383,7 +385,7 @@ matches the full model.
   three upper coordinates), `overlap` and `gpixels`.
 
 The trainer uses the frame lists, point tables and the part's ROI. The
-merge queries the label field or the core box. A run's `config.json` carries `partition` and
+merge queries the label field or the LCC split planes. A run's `config.json` carries `partition` and
 `partition_part`, which is how `find_partition_runs` pairs runs with parts
 without any naming convention.
 

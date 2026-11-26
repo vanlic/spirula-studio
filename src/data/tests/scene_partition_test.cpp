@@ -244,13 +244,29 @@ void check_lcc_partition() {
               part_data.points.num() == (int64_t)p.part_points[(size_t)right].size(),
           "LCC part applies its training frames and halo seeds");
     const std::string ply = (fs::temp_directory_path() / "spirula_lcc_seam_test.ply").string();
-    SplatCloud on_seam = splats_along_x(0, 0, 1, 0, 0.0f);
-    on_seam.means = {(float)seam[0], (float)seam[1], (float)seam[2]};
-    write_splat_ply(on_seam, ply);
+    SplatCloud splats = splats_along_x(0, 0, 3, 0, 0.0f);
+    const std::array seam_point{(float)seam[0], (float)seam[1], (float)seam[2]};
+    for (int i = 0; i < 3; ++i)
+        std::copy(seam_point.begin(), seam_point.end(), splats.means.begin() + i * 3);
+    const int across = (axis + 1) % 3;
+    splats.means[3 + axis] = (float)a.core.lo[axis] - 1;
+    splats.means[3 + across] = (float)a.core.hi[across] + 1;
+    splats.means[6 + axis] = (float)b.core.hi[axis] + 1;
+    splats.means[6 + across] = (float)b.core.lo[across] - 1;
+    write_splat_ply(splats, ply);
     MergeStats stats;
     const auto merged = merge_partition_splats(loaded, {ply, ply}, stats);
-    check(merged.num == 1 && stats.parts[(size_t)right].kept == 1,
-          "LCC merge retains only one copy of a splat on the seam");
+    const auto order = left == 0 ? std::array{1, 0, 2} : std::array{0, 2, 1};
+    std::vector<float> expected;
+    for (int i : order)
+        expected.insert(expected.end(), splats.means.begin() + i * 3, splats.means.begin() + (i + 1) * 3);
+    check(merged.num == 3 && stats.parts[(size_t)left].kept == 1 &&
+              stats.parts[(size_t)right].kept == 2 && merged.means == expected,
+          "LCC merge keeps exterior splats and assigns the seam to one part");
+    const std::string output = (fs::temp_directory_path() / "spirula_lcc_merge_test.ply").string();
+    merge_partition_splats_file(loaded, {ply, ply}, output, stats);
+    check(read_splat_ply(output).means == expected, "LCC file merge keeps exterior splats");
+    fs::remove(output);
     fs::remove(ply);
     fs::remove(file);
     fs::remove(fs::path(file).replace_extension(".bin"));

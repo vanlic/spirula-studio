@@ -91,11 +91,27 @@ bool same_camera_metadata(const MergeStats& a, const MergeStats& b) {
 
 using MergeRows = std::function<void(SplatCloud&, const std::vector<uint8_t>&)>;
 
+std::vector<SpatialPart> spatial_merge_parts(const ScenePartition& p) {
+    Aabb scene;
+    for (const SpatialPart& part : p.spatial_parts) scene.expand(part.core);
+
+    auto parts = p.spatial_parts;
+    const Aabb open = Aabb::everything();
+    for (SpatialPart& part : parts) {
+        for (int axis = 0; axis < 3; ++axis) {
+            if (part.core.lo[axis] == scene.lo[axis]) part.core.lo[axis] = open.lo[axis];
+            if (part.core.hi[axis] == scene.hi[axis]) part.core.hi[axis] = open.hi[axis];
+        }
+    }
+    return parts;
+}
+
 void visit_partition_splats(const ScenePartition& p, const std::vector<std::string>& paths,
                             MergeStats& stats, const MergeRows& rows,
                             const std::function<void(const std::string&)>& log) {
     stats = MergeStats{};
     stats.parts.resize((size_t)p.num_parts);
+    const auto spatial_parts = spatial_merge_parts(p);
     std::optional<bool> mip;
     for (int k = 0; k < p.num_parts; k++) {
         if (k >= (int)paths.size() || paths[(size_t)k].empty()) continue;
@@ -110,7 +126,7 @@ void visit_partition_splats(const ScenePartition& p, const std::vector<std::stri
         st.region_camera_hash = shape.region_camera_hash;
         const auto frame = part_frame(ply, run_dir, shape.region_camera_hash);
         const Sim3& S = frame.dataset_from_train;
-        const SpatialPart* spatial = p.spatial_parts.empty() ? nullptr : &p.spatial_parts[(size_t)k];
+        const SpatialPart* spatial = spatial_parts.empty() ? nullptr : &spatial_parts[(size_t)k];
         LabelField fallback_cameras;
         if (!frame.cameras && !spatial) {
             std::vector<float> cameras;
