@@ -128,6 +128,7 @@ struct ScenePartition {
     std::vector<int32_t> frames_of(int part) const;
     int64_t core_count(int part) const;
     std::shared_ptr<const Region> training_region(int part) const;
+    std::vector<SpatialPart> spatial_ownership_parts() const;
     // Connected pieces of the covisibility graph each part's core makes: 1 is
     // a part in one place, more is one the cut could not keep together.
     std::vector<int32_t> core_pieces;
@@ -139,12 +140,14 @@ struct ScenePartition {
     std::vector<float> view_share;
 };
 
+class LccLidarCache;
+
 // The partition of `ds` by `cov`. Throws when the dataset has no cameras, and
 // PartitionCancelled once `cancel` is set.
 ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
                                const PartitionOptions& opt, const PartitionLog& log = {},
                                const std::atomic<bool>* cancel = nullptr,
-                               const SparseStats* tracks = nullptr);
+                               const SparseStats* tracks = nullptr, LccLidarCache* lidar_cache = nullptr);
 
 // partition.json beside a `.bin` of the same stem holding the volume and the
 // point tables. `dataset` is recorded as given.

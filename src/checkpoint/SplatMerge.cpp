@@ -91,27 +91,12 @@ bool same_camera_metadata(const MergeStats& a, const MergeStats& b) {
 
 using MergeRows = std::function<void(SplatCloud&, const std::vector<uint8_t>&)>;
 
-std::vector<SpatialPart> spatial_merge_parts(const ScenePartition& p) {
-    Aabb scene;
-    for (const SpatialPart& part : p.spatial_parts) scene.expand(part.core);
-
-    auto parts = p.spatial_parts;
-    const Aabb open = Aabb::everything();
-    for (SpatialPart& part : parts) {
-        for (int axis = 0; axis < 3; ++axis) {
-            if (part.core.lo[axis] == scene.lo[axis]) part.core.lo[axis] = open.lo[axis];
-            if (part.core.hi[axis] == scene.hi[axis]) part.core.hi[axis] = open.hi[axis];
-        }
-    }
-    return parts;
-}
-
 void visit_partition_splats(const ScenePartition& p, const std::vector<std::string>& paths,
                             MergeStats& stats, const MergeRows& rows,
                             const std::function<void(const std::string&)>& log) {
     stats = MergeStats{};
     stats.parts.resize((size_t)p.num_parts);
-    const auto spatial_parts = spatial_merge_parts(p);
+    const auto spatial_parts = p.spatial_ownership_parts();
     std::optional<bool> mip;
     for (int k = 0; k < p.num_parts; k++) {
         if (k >= (int)paths.size() || paths[(size_t)k].empty()) continue;

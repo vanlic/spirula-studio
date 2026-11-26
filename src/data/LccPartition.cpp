@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -48,39 +49,53 @@ void check_cancel(const std::atomic<bool>* cancel) {
 }
 
 std::vector<double> sample_lidar(const ParsedDataset& ds, const PartitionOptions& opt,
+                                 const std::vector<double>& full,
                                  const PartitionLog& log, const std::atomic<bool>* cancel) {
     check_cancel(cancel);
-    cloud::Reader reader(opt.lcc_lidar_cloud);
+    std::unique_ptr<cloud::Reader> reader;
+    if (full.empty()) reader = std::make_unique<cloud::Reader>(opt.lcc_lidar_cloud);
+    std::string ext = std::filesystem::u8path(opt.lcc_lidar_cloud).extension().u8string();
+    for (char& ch : ext) ch = (char)std::tolower((unsigned char)ch);
     const double fraction = opt.lcc_lidar_sample_fraction > 0 ? opt.lcc_lidar_sample_fraction :
-        (reader.info().format == cloud::Format::Ply ? kLidarPlyFraction : kLidarLasFraction);
+        (ext == ".ply" ? kLidarPlyFraction : kLidarLasFraction);
     const uint64_t limit = (uint64_t)opt.max_projected_points;
     uint64_t pcg_state = 0x853c49e6748fea9bULL;
     std::mt19937_64 reservoir(42);
     uint64_t selected = 0, valid = 0;
     std::vector<double> xyz;
-    xyz.reserve((size_t)std::min<uint64_t>(limit, std::max<int64_t>(0, reader.info().points)) * 3);
-    const bool finished = reader.read([&](const e57::Point* points, size_t n) {
-        for (size_t i = 0; i < n; ++i) {
-            if (i % 4096 == 0) check_cancel(cancel);
-            const double q[] = {points[i].xyz[0] - ds.center[0], points[i].xyz[1] - ds.center[1],
-                                points[i].xyz[2] - ds.center[2]};
-            if (!std::all_of(q, q + 3, [](double v) { return std::isfinite(v); })) continue;
-            ++valid;
-            const uint64_t old = pcg_state;
-            pcg_state = old * 0x5851f42d4c957f2dULL + 0xda3e39cb94b95bdbULL;
-            const uint32_t bits = (uint32_t)(((old >> 18) ^ old) >> 27);
-            const unsigned rot = (unsigned)(old >> 59);
-            const uint32_t draw = (bits >> rot) | (bits << ((32 - rot) % 32));
-            if ((double)draw / 4294967296.0 >= fraction) continue;
-            ++selected;
-            if (selected <= limit) xyz.insert(xyz.end(), q, q + 3);
-            else {
-                const uint64_t row = std::uniform_int_distribution<uint64_t>(0, selected - 1)(reservoir);
-                if (row < limit) std::copy(q, q + 3, xyz.data() + (size_t)row * 3);
-            }
+    const uint64_t count = reader ? (uint64_t)std::max<int64_t>(0, reader->info().points) : full.size() / 3;
+    xyz.reserve((size_t)std::min(limit, count) * 3);
+    const auto add = [&](const double* point) {
+        const double q[] = {point[0] - ds.center[0], point[1] - ds.center[1], point[2] - ds.center[2]};
+        if (!std::all_of(q, q + 3, [](double v) { return std::isfinite(v); })) return;
+        ++valid;
+        const uint64_t old = pcg_state;
+        pcg_state = old * 0x5851f42d4c957f2dULL + 0xda3e39cb94b95bdbULL;
+        const uint32_t bits = (uint32_t)(((old >> 18) ^ old) >> 27);
+        const unsigned rot = (unsigned)(old >> 59);
+        const uint32_t draw = (bits >> rot) | (bits << ((32 - rot) % 32));
+        if ((double)draw / 4294967296.0 >= fraction) return;
+        ++selected;
+        if (selected <= limit) xyz.insert(xyz.end(), q, q + 3);
+        else {
+            const uint64_t row = std::uniform_int_distribution<uint64_t>(0, selected - 1)(reservoir);
+            if (row < limit) std::copy(q, q + 3, xyz.data() + (size_t)row * 3);
         }
-    }, cancel);
-    if (!finished) throw PartitionCancelled();
+    };
+    if (reader) {
+        const bool finished = reader->read([&](const e57::Point* points, size_t n) {
+            for (size_t i = 0; i < n; ++i) {
+                if (i % 4096 == 0) check_cancel(cancel);
+                add(points[i].xyz);
+            }
+        }, cancel);
+        if (!finished) throw PartitionCancelled();
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            if (i % 4096 == 0) check_cancel(cancel);
+            add(full.data() + i * 3);
+        }
+    }
     if (xyz.empty()) throw std::runtime_error("partition: no LiDAR points sampled; check the scan or raise the sample fraction");
     if (log) log("LCC: sampled " + std::to_string(xyz.size() / 3) + " of " + std::to_string(valid) +
                  " LiDAR points for voxelization");
@@ -425,8 +440,41 @@ void assign_training_data(const ParsedDataset& ds, const SeedRows& seeds, const 
 
 }  // namespace
 
+void LccLidarCache::prepare(const std::string& path) {
+    const auto file = std::filesystem::u8path(path);
+    const auto modified = std::filesystem::last_write_time(file);
+    const auto size = std::filesystem::file_size(file);
+    if (_path == path && _modified == modified && _size == size) return;
+    *this = {};
+    _path = path;
+    _modified = modified;
+    _size = size;
+}
+
+void LccLidarCache::retain_full(std::vector<double> xyz) {
+    _full = std::move(xyz);
+    _sample.clear();
+}
+
+const std::vector<double>& LccLidarCache::sample(const ParsedDataset& ds, const PartitionOptions& opt,
+                                                const PartitionLog& log, const std::atomic<bool>* cancel) {
+    check_cancel(cancel);
+    prepare(opt.lcc_lidar_cloud);
+    if (!_sample.empty() && _center == ds.center && _limit == opt.max_projected_points &&
+        _fraction == opt.lcc_lidar_sample_fraction) {
+        if (log) log("LCC: using cached LiDAR sample (" + std::to_string(_sample.size() / 3) + " points)");
+        return _sample;
+    }
+    if (!_full.empty() && log) log("LCC: sampling LiDAR points from memory");
+    _sample = sample_lidar(ds, opt, _full, log, cancel);
+    _center = ds.center;
+    _limit = opt.max_projected_points;
+    _fraction = opt.lcc_lidar_sample_fraction;
+    return _sample;
+}
+
 void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePartition& p,
-                   const PartitionLog& log, const std::atomic<bool>* cancel) {
+                   const PartitionLog& log, const std::atomic<bool>* cancel, LccLidarCache* lidar_cache) {
     const PartitionOptions& opt = p.options;
     const bool use_lidar = !opt.lcc_lidar_cloud.empty();
     if (opt.parts != 0 || opt.max_projected_points < 1 || !std::isfinite(opt.lcc_gpixels) ||
@@ -465,11 +513,13 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
     Aabb bounds = bound_points(ds.points.xyz.data(), seeds, opt.lcc_robust_bounds,
                                "seed points", log, cancel);
     SeedRows lidar_rows{0, {}};
-    std::vector<double> lidar;
+    const double* lidar_xyz = nullptr;
+    LccLidarCache local_cache;
     if (use_lidar) {
-        lidar = sample_lidar(ds, opt, log, cancel);
+        const auto& lidar = (lidar_cache ? *lidar_cache : local_cache).sample(ds, opt, log, cancel);
         lidar_rows.count = (int64_t)(lidar.size() / 3);
-        bounds = bound_points(lidar.data(), lidar_rows, opt.lcc_robust_bounds, "LiDAR points", log, cancel);
+        lidar_xyz = lidar.data();
+        bounds = bound_points(lidar_xyz, lidar_rows, opt.lcc_robust_bounds, "LiDAR points", log, cancel);
     }
     const double extent = std::max({bounds.hi[0] - bounds.lo[0], bounds.hi[1] - bounds.lo[1],
                                     bounds.hi[2] - bounds.lo[2]});
@@ -478,7 +528,7 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
         throw std::runtime_error("partition: LCC cannot determine a voxel size for this cloud");
     const double centered_origin[3] = {0, 0, 0};
     std::vector<Voxel> voxels = use_lidar
-        ? make_voxels(lidar.data(), lidar_rows, centered_origin, size, opt.max_projected_points, cancel)
+        ? make_voxels(lidar_xyz, lidar_rows, centered_origin, size, opt.max_projected_points, cancel)
         : make_voxels(ds.points.xyz.data(), seeds, bounds.lo, size, opt.max_projected_points, cancel);
     std::vector<ImageCoverage> images(n);
     if (log) log("LCC: projecting " + std::to_string(voxels.size()) + " voxels");

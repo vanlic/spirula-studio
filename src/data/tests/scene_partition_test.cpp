@@ -17,6 +17,8 @@
 #include "data/DatasetParser.h"
 #include "data/SparseEdit.h"
 #include "data/Json.h"
+#include "data/LccPartition.h"
+#include "data/PointCloudFile.h"
 #include "data/RegionProgram.h"
 #include "data/ScenePartition.h"
 #include "data/SceneTransform.h"
@@ -425,9 +427,40 @@ void check_lcc_lidar_partition() {
               sparse.spatial_parts[0].core.hi[2] < 51.0 &&
               std::find(logs.begin(), logs.end(), "LCC: sampled 200 of 6850 LiDAR points for voxelization") != logs.end(),
           "LCC projects a capped sample of the aligned LiDAR cloud");
+    LccLidarCache cache;
+    cache.prepare(opt.lcc_lidar_cloud);
+    std::vector<double> full;
+    {
+        spirula::cloud::Reader reader(opt.lcc_lidar_cloud);
+        reader.read([&](const e57::Point* points, size_t count) {
+            for (size_t i = 0; i < count; ++i)
+                full.insert(full.end(), points[i].xyz, points[i].xyz + 3);
+        });
+    }
+    cache.retain_full(std::move(full));
+    const auto log = [&](const std::string& line) { logs.push_back(line); };
+    logs.clear();
+    const auto cached = partition_scene(ds, cov, opt, log, nullptr, nullptr, &cache);
+    check(cached.frame_label == lidar.frame_label && cached.spatial_parts[0].gpixels == lidar.spatial_parts[0].gpixels &&
+              std::find(logs.begin(), logs.end(), "LCC: sampling LiDAR points from memory") != logs.end(),
+          "LCC samples the retained cloud with the same result as file streaming");
+    opt.lcc_gpixels *= 0.5;
+    logs.clear();
+    partition_scene(ds, cov, opt, log, nullptr, nullptr, &cache);
+    check(std::find(logs.begin(), logs.end(), "LCC: using cached LiDAR sample (200 points)") != logs.end(),
+          "LCC reuses the sampled cloud when the pixel budget changes");
     const fs::path file = fs::temp_directory_path() / "spirula_lcc_lidar_test.json";
     opt.lcc_lidar_sample_fraction = 0.75;
-    const auto custom = partition_scene(ds, cov, opt);
+    logs.clear();
+    const auto custom = partition_scene(ds, cov, opt, log, nullptr, nullptr, &cache);
+    check(std::find(logs.begin(), logs.end(), "LCC: sampling LiDAR points from memory") != logs.end(),
+          "LCC resamples the retained cloud when the sample fraction changes");
+    write_text(cloud, ply.str() + "\n");
+    logs.clear();
+    partition_scene(ds, cov, opt, log, nullptr, nullptr, &cache);
+    check(std::find(logs.begin(), logs.end(), "LCC: sampled 200 of 6850 LiDAR points for voxelization") != logs.end() &&
+              std::find(logs.begin(), logs.end(), "LCC: sampling LiDAR points from memory") == logs.end(),
+          "LCC reloads the scan after the source file changes");
     write_partition(custom, file.u8string(), "corridor");
     fs::remove(cloud);
     const auto loaded = read_partition(file.u8string());

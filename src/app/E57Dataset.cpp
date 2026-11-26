@@ -711,7 +711,7 @@ bool extract_e57_images(const std::string& input, const std::string& images_dir,
 
 ScanPreview read_scan_preview(const std::string& path, int64_t max_points,
                               const std::atomic<bool>* cancel,
-                              std::atomic<int64_t>* read) {
+                              std::atomic<int64_t>* read, int64_t full_limit) {
     ScanPreview p;
     spirula::cloud::Reader reader(path);
     if (e57::Reader* e = reader.e57())
@@ -723,10 +723,18 @@ ScanPreview read_scan_preview(const std::string& path, int64_t max_points,
             p.names.push_back(im.name.empty() ? std::to_string(i) : im.name);
         }
     const uint64_t below = draw_threshold(max_points, reader.info().points);
+    const int64_t total = reader.info().points;
+    bool keep_full = total > 0 && total <= full_limit;
+    if (keep_full) p.full_xyz.reserve((size_t)total * 3);
     uint64_t serial = 0;
     const bool whole = reader.read([&](const e57::Point* pt, size_t n) {
         if (read) *read += (int64_t)n;
+        if (keep_full && n > (size_t)total - p.full_xyz.size() / 3) {
+            keep_full = false;
+            std::vector<double>().swap(p.full_xyz);
+        }
         for (size_t i = 0; i < n; i++) {
+            if (keep_full) p.full_xyz.insert(p.full_xyz.end(), pt[i].xyz, pt[i].xyz + 3);
             if (splitmix64(serial++) > below) continue;
             p.xyz.insert(p.xyz.end(), pt[i].xyz, pt[i].xyz + 3);
             p.rgb.insert(p.rgb.end(), pt[i].rgb, pt[i].rgb + 3);

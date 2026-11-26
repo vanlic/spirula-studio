@@ -30,13 +30,23 @@ CPU estimate uses Spirula's camera models and point-cloud rasterization.
 
 In the Partition panel, select an aligned LiDAR cloud (LAS, LAZ, PLY or
 E57) to build the visibility voxels and partition bounds from it. The scan
-must already be in the dataset coordinate frame. The sampler streams the
+must already be in the dataset coordinate frame. The viewport shows a
+sampled preview as soon as it loads. Switch between the LiDAR and SfM
+clouds before or after computing the partition. The LiDAR result uses the
+same ownership planes as the merge for coloring and soloing a part.
+The partition sampler streams the
 file and selects points at a fixed random rate, by default 3% for LAS, LAZ
 and E57 and 20% for PLY. Set the fraction to 1 to sample from the full scan.
 If more points pass the sampling fraction than the projection point limit,
 Spirula keeps a uniform sample within the limit. The saved partition uses
 the dataset's own seed rows for training, so subsequent training and merge
 can run without reading the scan again.
+
+The Partition panel keeps the scan's full XYZ coordinates after preview
+when they fit in 256 MiB. It also caches the partition sample. Changing
+the sample fraction can use the full in-memory scan when available.
+For larger scans, repeated calculations reuse the sample until the
+sampling settings or the source file change.
 
 The largest block is split first. Each axis is ranked by its weighted
 5th-to-95th percentile span. The splitter tests up to 150, 100 and 50

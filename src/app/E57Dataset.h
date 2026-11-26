@@ -76,11 +76,12 @@ struct ScanPreview {
     std::vector<std::string> names;   // one per camera
     std::vector<double> xyz;
     std::vector<uint8_t> rgb;
+    std::vector<double> full_xyz;
     int64_t streamed = 0;
 };
 ScanPreview read_scan_preview(const std::string& path, int64_t max_points,
                               const std::atomic<bool>* cancel = nullptr,
-                              std::atomic<int64_t>* read = nullptr);
+                              std::atomic<int64_t>* read = nullptr, int64_t full_limit = 0);
 
 // Thins the cloud in place to at most `target` points, one per occupied voxel
 // (the mean of its points). Returns the voxel edge, 0 when nothing was merged.

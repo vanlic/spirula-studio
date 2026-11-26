@@ -911,6 +911,21 @@ bool SpatialPart::owns(const double xyz[3]) const {
     return true;
 }
 
+std::vector<SpatialPart> ScenePartition::spatial_ownership_parts() const {
+    Aabb scene;
+    for (const SpatialPart& part : spatial_parts) scene.expand(part.core);
+
+    auto parts = spatial_parts;
+    const Aabb open = Aabb::everything();
+    for (SpatialPart& part : parts) {
+        for (int axis = 0; axis < 3; ++axis) {
+            if (part.core.lo[axis] == scene.lo[axis]) part.core.lo[axis] = open.lo[axis];
+            if (part.core.hi[axis] == scene.hi[axis]) part.core.hi[axis] = open.hi[axis];
+        }
+    }
+    return parts;
+}
+
 std::shared_ptr<const Region> ScenePartition::training_region(int part) const {
     if (part < 0 || part >= num_parts) return {};
     if (spatial_parts.empty()) return field ? std::make_shared<LabelRegion>(field, part) : nullptr;
@@ -925,7 +940,8 @@ std::shared_ptr<const Region> ScenePartition::training_region(int part) const {
 
 ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
                                const PartitionOptions& opt, const PartitionLog& log,
-                               const std::atomic<bool>* cancel, const SparseStats* tracks) {
+                               const std::atomic<bool>* cancel, const SparseStats* tracks,
+                               LccLidarCache* lidar_cache) {
     const int64_t n_cam = ds.num_cameras;
     if (n_cam == 0) throw std::runtime_error("partition: the dataset has no cameras");
     if (!cov.camera_graph_built && opt.method != PartitionMethod::Voronoi && opt.method != PartitionMethod::Lcc)
@@ -941,7 +957,7 @@ ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
     p.source = cov.source;
     p.frame_names = FrameIndex(ds.image_filenames).unique_tails();
     if (opt.method == PartitionMethod::Lcc) {
-        partition_lcc(ds, tracks, p, log, cancel);
+        partition_lcc(ds, tracks, p, log, cancel, lidar_cache);
         return p;
     }
 

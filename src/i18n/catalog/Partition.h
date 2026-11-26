@@ -203,6 +203,33 @@ SS_MSG(lbl_lcc_lidar,
     IT("Nuvola di punti LiDAR"), NL("LiDAR-puntenwolk"), RU("Облако точек LiDAR"),
     TR("LiDAR nokta bulutu"));
 
+SS_MSG(preview_sfm_cloud,
+    EN("SfM point cloud"), JA("SfM 点群"), ZH_HANS("SfM 点云"),
+    ZH_HANT("SfM 點雲"), KO("SfM 포인트 클라우드"), DE("SfM-Punktwolke"),
+    FR("Nuage de points SfM"), ES("Nube de puntos SfM"), PT("Nuvem de pontos SfM"),
+    IT("Nuvola di punti SfM"), NL("SfM-puntenwolk"), RU("Облако точек SfM"),
+    TR("SfM nokta bulutu"));
+
+SS_MSG(status_reading_lidar,
+    EN("Loading LiDAR preview…"), JA("LiDAR のプレビューを読み込み中…"),
+    ZH_HANS("正在加载激光雷达预览…"), ZH_HANT("正在載入雷射雷達預覽…"),
+    KO("라이다 미리보기 불러오는 중…"), DE("LiDAR-Vorschau wird geladen …"),
+    FR("Chargement de l’aperçu LiDAR…"), ES("Cargando vista previa LiDAR…"),
+    PT("Carregando prévia LiDAR…"), IT("Caricamento anteprima LiDAR…"),
+    NL("LiDAR-voorbeeld laden…"), RU("Загрузка предпросмотра LiDAR…"),
+    TR("LiDAR önizlemesi yükleniyor…"));
+
+SS_MSG(err_empty_lidar_preview,
+    EN("The LiDAR file has no points to preview."), JA("この LiDAR ファイルには表示できる点がありません。"),
+    ZH_HANS("该激光雷达文件没有可预览的点。"), ZH_HANT("此雷射雷達檔案沒有可預覽的點。"),
+    KO("라이다 파일에 미리 볼 점이 없습니다."), DE("Die LiDAR-Datei enthält keine Punkte für die Vorschau."),
+    FR("Ce fichier LiDAR ne contient aucun point à afficher."),
+    ES("El archivo LiDAR no contiene puntos que mostrar."),
+    PT("O arquivo LiDAR não contém pontos para exibir."),
+    IT("Il file LiDAR non contiene punti da mostrare."),
+    NL("Het LiDAR-bestand bevat geen punten om weer te geven."),
+    RU("В файле LiDAR нет точек для просмотра."), TR("LiDAR dosyasında önizlenecek nokta yok."));
+
 SS_MSG(opt_lcc_lidar,
     EN("Choose a scan aligned to the dataset. Leave blank to use dataset points for partitioning."),
     JA("データセットに整列したスキャンを選びます。空欄ならデータセットの点で分割します。"),

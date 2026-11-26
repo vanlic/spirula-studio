@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -44,11 +45,12 @@ public:
     void destroy_gl();
 
 private:
-    enum class Job { None, Load, Compute, Merge };
+    enum class Job { None, Load, LoadLidar, Compute, Merge };
 
     void start(Job job);
     void run_load();
-    void run_compute();
+    void run_load_lidar(spirula::LccLidarCache& cache);
+    void run_compute(spirula::LccLidarCache* cache);
     void run_merge();
     void poll();
     void refresh_view();
@@ -56,6 +58,7 @@ private:
     void draw_parts_table();
     void draw_merge();
     bool options_changed() const;
+    std::string lidar_path(const std::string& path) const;
 
     bool _open = false;
     std::string _dataset;
@@ -73,6 +76,9 @@ private:
 
     // ---- what the worker produced (read on the GUI thread once _done) ----
     ParsedDataset _ds;
+    ColmapPoints3D _lidar_points;
+    ColmapPoints3D _new_lidar_points;
+    std::shared_ptr<spirula::LccLidarCache> _lidar_cache;
     PostSplitCameras _post;
     spirula::SparseStats _tracks;
     bool _loaded = false;
@@ -92,11 +98,13 @@ private:
 
     // ---- options on screen ----
     spirula::PartitionOptions _opt;
+    std::string _lidar_path_edit;
     int _mode = 1;   // 0: number of parts, 1: cameras per part
     int _source_idx = 0;
 
     // ---- the view ----
     ViewportPanel _view;
+    bool _show_lidar = false;
     bool _view_dirty = false;
     int _show_part = -1;   // -1: every part
     bool _owner_colors = true;

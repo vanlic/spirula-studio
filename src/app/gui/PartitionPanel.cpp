@@ -2,12 +2,14 @@
 
 #include "app/gui/PartitionPanel.h"
 
+#include "app/E57Dataset.h"
 #include "app/webviewer/RegionOverlay.h"
 
 #include "app/gui/Layout.h"
 #include "app/gui/Ui.h"
 #include "checkpoint/SplatMerge.h"
 #include "checkpoint/SplatPly.h"
+#include "data/LccPartition.h"
 #include "i18n/catalog/Dataset.h"
 #include "i18n/catalog/Gui.h"
 #include "i18n/catalog/Partition.h"
@@ -19,6 +21,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <stdexcept>
 
 namespace fs = std::filesystem;
 namespace dmsg = spirula::i18n::msg::dataset;
@@ -65,6 +68,11 @@ void PartitionPanel::open(const std::string& dataset_dir, Hooks hooks) {
     _dataset = dataset_dir;
     _opt.lcc_lidar_cloud.clear();
     _opt.lcc_lidar_sample_fraction = 0.0;
+    _lidar_path_edit.clear();
+    _lidar_points = {};
+    _new_lidar_points = {};
+    _lidar_cache.reset();
+    _show_lidar = false;
     _hooks = std::move(hooks);
     _loaded = _cov_valid = _part_valid = false;
     _ds = ParsedDataset{};
@@ -90,16 +98,34 @@ void PartitionPanel::open(const std::string& dataset_dir, Hooks hooks) {
 
 void PartitionPanel::close() {
     _open = false;
-    // A split nobody will look at is not worth finishing.
-    if (_job.load() == Job::Compute) _cancel = true;
+    const Job job = _job.load();
+    if (job == Job::Compute || job == Job::LoadLidar) _cancel = true;
     if (_worker.joinable() && !_busy.load()) _worker.join();
+    _lidar_cache.reset();
     _view.detach();
 }
 
 void PartitionPanel::destroy_gl() { _view.destroy_gl(); }
 
 void PartitionPanel::set_lidar_cloud(const std::string& path) {
-    if (_open && !_busy.load() && !path.empty()) _opt.lcc_lidar_cloud = path;
+    if (!_open || _busy.load()) return;
+    _lidar_path_edit = path;
+    if (_opt.lcc_lidar_cloud == path && _lidar_points.num() != 0) {
+        _show_lidar = true;
+        _view_dirty = true;
+        return;
+    }
+    _opt.lcc_lidar_cloud = path;
+    _lidar_points = {};
+    _show_lidar = !path.empty();
+    _lidar_cache = _show_lidar ? std::make_shared<spirula::LccLidarCache>() : nullptr;
+    _view_dirty = true;
+    _status.clear();
+    if (_show_lidar) start(Job::LoadLidar);
+}
+
+std::string PartitionPanel::lidar_path(const std::string& path) const {
+    return (fs::u8path(_dataset) / fs::u8path(path)).lexically_normal().u8string();
 }
 
 // ---------------------------------------------------------------------------
@@ -120,11 +146,12 @@ void PartitionPanel::start(Job job) {
         _cancelled = false;
         _log_lines.clear();
     }
-    _worker = std::thread([this, job] {
+    _worker = std::thread([this, job, cache = _lidar_cache] {
         try {
             switch (job) {
                 case Job::Load: run_load(); break;
-                case Job::Compute: run_compute(); break;
+                case Job::LoadLidar: run_load_lidar(*cache); break;
+                case Job::Compute: run_compute(cache.get()); break;
                 case Job::Merge: run_merge(); break;
                 case Job::None: break;
             }
@@ -153,7 +180,20 @@ void PartitionPanel::run_load() {
     _loaded = true;
 }
 
-void PartitionPanel::run_compute() {
+void PartitionPanel::run_load_lidar(spirula::LccLidarCache& cache) {
+    constexpr int64_t full_limit = (256LL << 20) / (3 * sizeof(double));
+    const std::string path = lidar_path(_opt.lcc_lidar_cloud);
+    cache.prepare(path);
+    auto scan = app::read_scan_preview(path, 200000, &_cancel, nullptr, full_limit);
+    if (_cancel.load()) throw spirula::PartitionCancelled();
+    if (scan.xyz.empty()) throw std::runtime_error(pmsg::err_empty_lidar_preview.get());
+    cache.retain_full(std::move(scan.full_xyz));
+    for (size_t i = 0; i < scan.xyz.size(); i += 3)
+        for (int axis = 0; axis < 3; ++axis) scan.xyz[i + axis] -= _ds.center[axis];
+    _new_lidar_points = {std::move(scan.xyz), std::move(scan.rgb)};
+}
+
+void PartitionPanel::run_compute(spirula::LccLidarCache* cache) {
     auto log = [this](const std::string& s) {
         std::lock_guard<std::mutex> lk(_mu);
         _log_lines.push_back(s);
@@ -167,7 +207,7 @@ void PartitionPanel::run_compute() {
     if (lcc) {
         opt.parts = 0;
         if (!opt.lcc_lidar_cloud.empty())
-            opt.lcc_lidar_cloud = (fs::u8path(_dataset) / fs::u8path(opt.lcc_lidar_cloud)).lexically_normal().u8string();
+            opt.lcc_lidar_cloud = lidar_path(opt.lcc_lidar_cloud);
     }
     const bool reuse = !lcc && _cov_valid && _cov_opt.method != spirula::PartitionMethod::Lcc &&
                        _cov_opt.source == opt.source &&
@@ -182,7 +222,7 @@ void PartitionPanel::run_compute() {
         _cov_opt = opt;
         _cov_valid = true;
     }
-    spirula::ScenePartition part = spirula::partition_scene(_ds, _cov, opt, log, &_cancel, &_tracks);
+    spirula::ScenePartition part = spirula::partition_scene(_ds, _cov, opt, log, &_cancel, &_tracks, cache);
     if (_cancel.load()) throw spirula::PartitionCancelled();
     std::vector<spirula::RegionMesh> meshes;
     if (lcc) {
@@ -238,6 +278,7 @@ void PartitionPanel::poll() {
     if (_hooks.log)
         for (const std::string& l : lines) _hooks.log(l);
     if (cancelled) {
+        if (job == Job::LoadLidar) _show_lidar = false;
         _notice = &pmsg::status_cancelled;
         return;
     }
@@ -246,12 +287,17 @@ void PartitionPanel::poll() {
         else _status = error;
         if (_hooks.log) _hooks.log(error);
         if (job == Job::Load) _loaded = false;
+        if (job == Job::LoadLidar) _show_lidar = false;
         return;
     }
     switch (job) {
         case Job::Load:
             _status.clear();
             if (!spirula::tracks_usable(_ds, _tracks)) _opt.lcc_min_track_length = 0;
+            _view_dirty = true;
+            break;
+        case Job::LoadLidar:
+            _lidar_points = std::move(_new_lidar_points);
             _view_dirty = true;
             break;
         case Job::Compute:
@@ -305,7 +351,10 @@ void PartitionPanel::refresh_view() {
     _view_dirty = false;
     if (!_loaded || !_gl_ok) return;
     ParsedDataset show = _ds;
-    const int64_t n_pts = _ds.points.num();
+    const bool lidar = _show_lidar && _lidar_points.num() != 0;
+    const ColmapPoints3D& points = lidar ? _lidar_points : _ds.points;
+    if (lidar) show.points = points;
+    const int64_t n_pts = points.num();
     const int64_t n_cam = _ds.num_cameras;
     std::vector<float> cam_rgb;
     std::shared_ptr<const spirula::RegionOverlay> overlay;
@@ -331,9 +380,10 @@ void PartitionPanel::refresh_view() {
             for (int k = 0; k < 3; k++) cam_rgb[(size_t)i * 3 + k] = c[k] * mul + add;
         }
 
-        if ((int64_t)_part.point_label.size() == n_pts) {
+        if (lidar || (int64_t)_part.point_label.size() == n_pts) {
+            const auto ownership = lidar ? _part.spatial_ownership_parts() : std::vector<spirula::SpatialPart>{};
             std::vector<uint8_t> in_part;
-            if (solo >= 0) {
+            if (solo >= 0 && !lidar) {
                 in_part.assign((size_t)n_pts, 0);
                 for (int64_t i : _part.part_points[(size_t)solo])
                     if (i >= 0 && i < n_pts) in_part[(size_t)i] = 1;
@@ -344,10 +394,29 @@ void PartitionPanel::refresh_view() {
             show.points.rgb.reserve((size_t)n_pts * 3);
             const bool filtered = _part.filters_seed_points();
             for (int64_t i = 0; i < n_pts; i++) {
-                const int label = _part.point_label[(size_t)i];
-                if (filtered && label < 0) continue;
-                if (solo >= 0 && !in_part[(size_t)i]) continue;
-                for (int k = 0; k < 3; k++) show.points.xyz.push_back(_ds.points.xyz[(size_t)i * 3 + k]);
+                const double* q = points.xyz.data() + (size_t)i * 3;
+                int label = -1;
+                if (lidar) {
+                    const double world[3] = {q[0] + _ds.center[0], q[1] + _ds.center[1], q[2] + _ds.center[2]};
+                    if (!ownership.empty()) {
+                        if (solo >= 0) {
+                            if (!ownership[(size_t)solo].owns(world)) continue;
+                            label = solo;
+                        } else {
+                            const auto it = std::find_if(ownership.begin(), ownership.end(),
+                                [&](const spirula::SpatialPart& p) { return p.owns(world); });
+                            if (it != ownership.end()) label = (int)(it - ownership.begin());
+                        }
+                    } else if (_part.field) {
+                        label = _part.field->label(world);
+                    }
+                    if (solo >= 0 && label != solo) continue;
+                } else {
+                    label = _part.point_label[(size_t)i];
+                    if (filtered && label < 0) continue;
+                    if (solo >= 0 && !in_part[(size_t)i]) continue;
+                }
+                show.points.xyz.insert(show.points.xyz.end(), q, q + 3);
                 float c[3];
                 if (_owner_colors) {
                     spirula::part_color(label, c);
@@ -356,7 +425,7 @@ void PartitionPanel::refresh_view() {
                         for (float& v : c) v = 0.35f * v + 0.25f;
                 } else {
                     for (int k = 0; k < 3; k++)
-                        c[k] = _ds.points.rgb.empty() ? 0.78f : _ds.points.rgb[(size_t)i * 3 + k] / 255.0f;
+                        c[k] = points.rgb.empty() ? 0.78f : points.rgb[(size_t)i * 3 + k] / 255.0f;
                 }
                 for (int k = 0; k < 3; k++)
                     show.points.rgb.push_back((uint8_t)std::lround(std::clamp(c[k], 0.0f, 1.0f) * 255.0f));
@@ -389,7 +458,7 @@ void PartitionPanel::refresh_view() {
 void PartitionPanel::draw() {
     if (!_open) return;
     poll();
-    if (_view_dirty && !_busy.load()) refresh_view();
+    if (_view_dirty && (!_busy.load() || _job.load() != Job::Load)) refresh_view();
 
     const ImGuiViewport* vp = ImGui::GetMainViewport();
     ImGui::SetNextWindowSize(ImVec2(vp->WorkSize.x * 0.85f, vp->WorkSize.y * 0.85f),
@@ -409,10 +478,26 @@ void PartitionPanel::draw() {
     ImGui::EndChild();
     ImGui::SameLine();
     ImGui::BeginChild("##partview", ImVec2(0, 0), ImGuiChildFlags_None);
+    const Job job = _job.load();
+    if (_view.preview_active() || job == Job::LoadLidar) {
+        const bool lidar_available = _lidar_points.num() != 0;
+        if (ui::RadioButton(pmsg::preview_sfm_cloud, !_show_lidar || !lidar_available)) {
+            _show_lidar = false;
+            _view_dirty = true;
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!lidar_available);
+        if (ui::RadioButton(pmsg::lbl_lcc_lidar, _show_lidar && lidar_available)) {
+            _show_lidar = true;
+            _view_dirty = true;
+        }
+        ImGui::EndDisabled();
+    }
     if (_view.preview_active()) {
         _view.draw(/*training=*/false);
     } else if (_busy.load()) {
-        ui::TextDisabled(_job.load() == Job::Load ? pmsg::status_reading : pmsg::status_computing);
+        ui::TextDisabled(job == Job::Load ? pmsg::status_reading
+                         : job == Job::LoadLidar ? pmsg::status_reading_lidar : pmsg::status_computing);
     }
     ImGui::EndChild();
 
@@ -422,10 +507,12 @@ void PartitionPanel::draw() {
 
 void PartitionPanel::draw_controls() {
     const bool busy = _busy.load();
+    const Job job = _job.load();
     if (busy) {
-        ui::TextDisabled(_job.load() == Job::Load ? pmsg::status_reading
-                         : _job.load() == Job::Merge ? pmsg::merge_head : pmsg::status_computing);
-        if (_job.load() == Job::Compute) {
+        ui::TextDisabled(job == Job::Load ? pmsg::status_reading
+                         : job == Job::LoadLidar ? pmsg::status_reading_lidar
+                         : job == Job::Merge ? pmsg::merge_head : pmsg::status_computing);
+        if (job == Job::Compute || job == Job::LoadLidar) {
             ImGui::SameLine();
             ImGui::BeginDisabled(_cancel.load());
             if (ui::Button(gmsg::cancel)) _cancel = true;
@@ -461,7 +548,9 @@ void PartitionPanel::draw_controls() {
         ui::Text(pmsg::lbl_lcc_lidar);
         ui::help_on_hover(pmsg::opt_lcc_lidar);
         ImGui::SetNextItemWidth(px(150.0f));
-        ui::InputTextRaw("##lcc_lidar_cloud", &_opt.lcc_lidar_cloud);
+        const bool entered = ui::InputTextRaw("##lcc_lidar_cloud", &_lidar_path_edit,
+                                              ImGuiInputTextFlags_EnterReturnsTrue);
+        if (entered || ImGui::IsItemDeactivatedAfterEdit()) set_lidar_cloud(_lidar_path_edit);
         ui::help_on_hover(pmsg::opt_lcc_lidar);
         if (_hooks.pick_lidar) {
             ImGui::SameLine();
@@ -469,7 +558,7 @@ void PartitionPanel::draw_controls() {
         }
         if (!_opt.lcc_lidar_cloud.empty()) {
             ImGui::SameLine();
-            if (ui::Button(dmsg::remove)) _opt.lcc_lidar_cloud.clear();
+            if (ui::Button(dmsg::remove)) set_lidar_cloud({});
             ImGui::SetNextItemWidth(px(120.0f));
             if (ui::InputDouble(pmsg::lbl_lcc_lidar_sample, &_opt.lcc_lidar_sample_fraction, "%g"))
                 _opt.lcc_lidar_sample_fraction = std::clamp(_opt.lcc_lidar_sample_fraction, 0.0, 1.0);
@@ -540,7 +629,7 @@ void PartitionPanel::draw_controls() {
 
     const bool stale = options_changed();
     if (stale) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.20f, 0.45f, 0.75f, 1.0f));
-    if (ui::Button(pmsg::btn_compute)) {
+    if (ui::Button(pmsg::btn_compute) && !_busy.load()) {
         _compute_opt = _opt;
         start(Job::Compute);
     }
