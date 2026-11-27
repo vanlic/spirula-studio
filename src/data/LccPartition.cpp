@@ -1,5 +1,6 @@
 #include "data/LccPartition.h"
 
+#include "core/CameraModel.h"
 #include "data/PointCloudFile.h"
 #include "data/RegionMesh.h"
 #include "data/SceneProjection.h"
@@ -25,6 +26,24 @@ std::array<int, 2> lcc_raster_dimensions(int width, int height) {
             std::clamp((int)std::ceil(height * scale), 1, kLccRasterSize)};
 }
 
+bool lcc_is_fisheye(int camera_model) {
+    const auto model = static_cast<CameraModelType>(camera_model);
+    return model == CameraModelType::FISHEYE || model == CameraModelType::EQUISOLID;
+}
+
+std::vector<uint8_t> lcc_raster_aperture(int width, int height, double cx, double cy, double rx, double ry) {
+    std::vector<uint8_t> pixels((size_t)width * height);
+    const double hx = 0.5 / width, hy = 0.5 / height;
+    for (int y = 0; y < height; ++y) {
+        const double dy = (std::abs((y + 0.5) / height - cy) + hy) / ry;
+        for (int x = 0; x < width; ++x) {
+            const double dx = (std::abs((x + 0.5) / width - cx) + hx) / rx;
+            pixels[(size_t)y * width + x] = dx * dx + dy * dy <= 1.0;
+        }
+    }
+    return pixels;
+}
+
 namespace {
 
 constexpr double kCoverage = 0.03;
@@ -38,11 +57,18 @@ struct Voxel {
     double load = 0;
 };
 
+struct SkyCoverage {
+    int valid_pixels = 0;
+    std::vector<int> part_pixels;
+};
+
 struct ImageCoverage {
     std::vector<std::pair<int, int>> cells;
     int cols = 0, rows = 0;
     int valid_pixels = 0;
     double cell_load = 0;
+    std::unique_ptr<LccRasterMask> occupied;
+    SkyCoverage sky;
 };
 
 struct SeedRows {
@@ -174,7 +200,7 @@ std::vector<Voxel> make_voxels(const double* xyz, const SeedRows& seeds, const d
 
 ImageCoverage rasterize(const FrameView& view, const std::vector<Voxel>& voxels, double size,
                         std::vector<int>& counts, const std::atomic<bool>* cancel,
-                        const LccRasterMask* mask,
+                        const LccRasterMask* mask, bool keep_occupied = false,
                         std::vector<int>* pixel_voxel = nullptr) {
     const int w = view.cam.width, h = view.cam.height;
     ImageCoverage result;
@@ -218,8 +244,13 @@ ImageCoverage rasterize(const FrameView& view, const std::vector<Voxel>& voxels,
                 }
             }
     }
-    for (int i : owner)
-        if (i >= 0 && counts[(size_t)i]++ == 0) result.cells.emplace_back(i, 0);
+    if (keep_occupied) result.occupied = std::make_unique<LccRasterMask>();
+    for (size_t pixel = 0; pixel < owner.size(); ++pixel) {
+        const int i = owner[pixel];
+        if (i < 0) continue;
+        if (result.occupied) result.occupied->set(pixel);
+        if (counts[(size_t)i]++ == 0) result.cells.emplace_back(i, 0);
+    }
     for (auto& [i, count] : result.cells) {
         count = counts[(size_t)i];
         counts[(size_t)i] = 0;
@@ -406,10 +437,139 @@ void count_part_pixels(const ImageCoverage& image, const std::vector<std::vector
         for (int part : voxel_parts[(size_t)voxel]) counts[(size_t)part] += count;
 }
 
+using Direction = std::array<double, 3>;
+
+double dot(const Direction& a, const double* b) {
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+
+bool faces_block(const FrameView& view, const Aabb& box, double min_cosine) {
+    Direction to;
+    for (int axis = 0; axis < 3; ++axis)
+        to[axis] = std::clamp(view.t[axis], box.lo[axis], box.hi[axis]) - view.t[axis];
+    const double distance = std::sqrt(dot(to, to.data()));
+    if (distance > 0) return dot(to, view.R + 6) >= min_cosine * distance;
+    double nearest = std::numeric_limits<double>::infinity();
+    double facing = -1.0;
+    for (int axis = 0; axis < 3; ++axis) {
+        const double low = view.t[axis] - box.lo[axis];
+        const double high = box.hi[axis] - view.t[axis];
+        const double step = std::min(low, high);
+        const double cosine = low == high ? std::abs(view.R[6 + axis]) :
+            (low < high ? -view.R[6 + axis] : view.R[6 + axis]);
+        if (step < nearest || (step == nearest && cosine > facing)) {
+            nearest = step;
+            facing = cosine;
+        }
+    }
+    return nearest == 0.0 || facing >= min_cosine;
+}
+
+struct SkyPrism {
+    Aabb footprint;
+    double roof = 0;
+
+    bool hit(const Direction& origin, const Direction& ray, double enter) const {
+        double exit = std::numeric_limits<double>::infinity();
+        for (int axis = 0; axis < 3; ++axis) {
+            if (ray[axis] == 0.0) {
+                if (origin[axis] < footprint.lo[axis] || origin[axis] > footprint.hi[axis]) return false;
+                continue;
+            }
+            const double a = (footprint.lo[axis] - origin[axis]) / ray[axis];
+            const double b = (footprint.hi[axis] - origin[axis]) / ray[axis];
+            enter = std::max(enter, std::min(a, b));
+            exit = std::min(exit, std::max(a, b));
+            if (exit < enter) return false;
+        }
+        return exit > 0;
+    }
+};
+
+void estimate_sky_coverage(const ParsedDataset& ds, const std::vector<SpatialPart>& parts,
+                           const LccProjectionMasks* masks, double max_angle,
+                           std::vector<ImageCoverage>& images, const std::atomic<bool>* cancel) {
+    const Direction up = ds.gauge_oriented ? Direction{0, 0, 1} :
+        Direction{ds.normalized_rotation[6], ds.normalized_rotation[7], ds.normalized_rotation[8]};
+    // The projected box footprint has edge normals up × each box axis.
+    const Direction axes[] = {{0, up[2], -up[1]}, {-up[2], 0, up[0]}, {up[1], -up[0], 0}};
+    const auto project_ground = [&](const double* v) -> Direction {
+        return {dot(axes[0], v), dot(axes[1], v), dot(axes[2], v)};
+    };
+    std::vector<SkyPrism> prisms(parts.size());
+    for (size_t k = 0; k < parts.size(); ++k) {
+        auto& prism = prisms[k];
+        prism.roof = -std::numeric_limits<double>::infinity();
+        const Aabb& box = parts[k].core;
+        for (int bits = 0; bits < 8; ++bits) {
+            const double corner[] = {(bits & 1) ? box.hi[0] : box.lo[0],
+                                     (bits & 2) ? box.hi[1] : box.lo[1],
+                                     (bits & 4) ? box.hi[2] : box.lo[2]};
+            prism.footprint.expand(project_ground(corner).data());
+            prism.roof = std::max(prism.roof, dot(up, corner));
+        }
+    }
+    const double min_cosine = std::cos(max_angle * (3.14159265358979323846 / 180.0));
+#pragma omp parallel for schedule(dynamic, 4)
+    for (int64_t i = 0; i < ds.num_cameras; ++i) {
+        if (cancel && cancel->load(std::memory_order_relaxed)) continue;
+        ImageCoverage& image = images[(size_t)i];
+        if (image.valid_pixels == 0) continue;
+        const FrameView view = frame_view(ds, i);
+        const bool fisheye = lcc_is_fisheye(view.cam.model);
+        auto& sky = image.sky;
+        sky.part_pixels.assign(parts.size(), -1);
+        std::vector<size_t> candidates;
+        for (size_t k = 0; k < parts.size(); ++k) {
+            if (fisheye && !faces_block(view, parts[k].core, min_cosine)) continue;
+            sky.part_pixels[k] = 0;
+            candidates.push_back(k);
+        }
+        if (candidates.empty()) continue;
+
+        const auto* keep = masks && !masks->frames.empty() ? masks->frames[(size_t)i].get() : nullptr;
+        const auto* aperture = fisheye && masks && !masks->apertures.empty() ? masks->apertures[(size_t)i].get() : nullptr;
+        std::vector<uint8_t> fallback;
+        if (fisheye && !aperture) {
+            const double radius = 0.5 * std::min(view.cam.width, view.cam.height);
+            fallback = lcc_raster_aperture(image.cols, image.rows, 0.5, 0.5,
+                                            radius / view.cam.width, radius / view.cam.height);
+        }
+        const Direction origin = project_ground(view.t);
+        const double height = dot(up, view.t);
+        for (int y = 0; y < image.rows; ++y) {
+            if (cancel && cancel->load(std::memory_order_relaxed)) break;
+            for (int x = 0; x < image.cols; ++x) {
+                const size_t at = (size_t)y * image.cols + x;
+                if ((keep && !(*keep)[at]) || (aperture && !(*aperture)[at]) ||
+                    (!fallback.empty() && !fallback[at])) continue;
+                ++sky.valid_pixels;
+                if (image.occupied && (*image.occupied)[at]) continue;
+                const double px[] = {(x + 0.5) * view.cam.width / image.cols,
+                                     (y + 0.5) * view.cam.height / image.rows};
+                double local[3];
+                if (!camhost::pixel_ray(view.cam, px, local)) continue;
+                double ray[3];
+                for (int axis = 0; axis < 3; ++axis)
+                    ray[axis] = view.R[axis] * local[0] + view.R[3 + axis] * local[1] + view.R[6 + axis] * local[2];
+                const double rise = dot(up, ray);
+                if (!(rise > 0)) continue;
+                const Direction ground_ray = project_ground(ray);
+                for (size_t k : candidates) {
+                    const SkyPrism& prism = prisms[k];
+                    if (prism.hit(origin, ground_ray, std::max(0.0, (prism.roof - height) / rise)))
+                        ++sky.part_pixels[k];
+                }
+            }
+        }
+    }
+    check_cancel(cancel);
+}
+
 std::vector<std::vector<int>> assign_training_data(const ParsedDataset& ds, const SeedRows& seeds,
                                                    const std::vector<Voxel>& voxels,
                                                    const std::vector<ImageCoverage>& images, ScenePartition& p,
-                                                   const std::atomic<bool>* cancel) {
+                                                   const PartitionLog& log, const std::atomic<bool>* cancel) {
     std::vector<Aabb> expanded;
     for (const SpatialPart& block : p.spatial_parts) expanded.push_back(block.expanded());
     std::vector<std::vector<int>> in_voxel(voxels.size());
@@ -427,10 +587,12 @@ std::vector<std::vector<int>> assign_training_data(const ParsedDataset& ds, cons
     p.view_share.assign(n, 0.0f);
     std::vector<int> best_frame(n, -1), frame_count(n, 0), coverage(n);
     std::vector<double> best_share(n, 0), share_sum(n, 0);
+    std::vector<int> sky_added(n, 0);
+    const double sky_min = p.options.lcc_sky_min_percent / 100.0;
     for (size_t c = 0; c < images.size(); ++c) {
         check_cancel(cancel);
         const ImageCoverage& image = images[c];
-        if (image.cells.empty()) continue;
+        if (image.valid_pixels == 0) continue;
         count_part_pixels(image, in_voxel, coverage);
         const auto primary = std::max_element(coverage.begin(), coverage.end());
         if (*primary > kCoverage * image.valid_pixels) p.frame_label[c] = (int32_t)(primary - coverage.begin());
@@ -440,16 +602,29 @@ std::vector<std::vector<int>> assign_training_data(const ParsedDataset& ds, cons
                 best_share[k] = share;
                 best_frame[k] = (int)c;
             }
-            if (share <= kCoverage) continue;
-            if (p.frame_label[c] != (int32_t)k) p.ring[k].push_back((int32_t)c);
+            const bool visible = share > kCoverage;
+            const bool sky = image.sky.valid_pixels > 0 &&
+                image.sky.part_pixels[k] > sky_min * image.sky.valid_pixels;
+            if (p.frame_label[c] != (int32_t)k && (visible || sky)) {
+                p.ring[k].push_back((int32_t)c);
+                if (!visible) ++sky_added[k];
+            }
+            if (!visible) continue;
             ++frame_count[k];
             share_sum[k] += share;
         }
     }
     for (size_t k = 0; k < n; ++k) {
         if (best_frame[k] < 0) throw std::runtime_error("partition: LCC block has no visible training image");
-        if (frame_count[k] == 0) p.ring[k].push_back(best_frame[k]);
+        if (frame_count[k] == 0) {
+            auto& ring = p.ring[k];
+            const auto first = std::lower_bound(ring.begin(), ring.end(), best_frame[k]);
+            if (first == ring.end() || *first != best_frame[k]) ring.insert(first, best_frame[k]);
+            else --sky_added[k];
+        }
         p.view_share[k] = (float)(frame_count[k] ? share_sum[k] / frame_count[k] : best_share[k]);
+        if (log && sky_added[k] > 0)
+            log("LCC part " + std::to_string(k) + ": added " + std::to_string(sky_added[k]) + " sky ring images");
     }
     p.point_label.assign((size_t)ds.points.num(), -1);
     for (int64_t i = 0; i < seeds.count; ++i) {
@@ -470,6 +645,7 @@ struct LccProjectionDebug::Data {
     std::vector<Voxel> voxels;
     std::vector<std::vector<int>> voxel_parts;
     LccProjectionMasks masks;
+    std::vector<SkyCoverage> sky;
     double voxel_size;
     int num_parts;
 };
@@ -483,13 +659,18 @@ LccFrameProjection LccProjectionDebug::project(const ParsedDataset& ds, int64_t 
     const auto& masks = _data->masks.frames;
     const auto* mask = masks.empty() ? nullptr : masks[(size_t)camera].get();
     const ImageCoverage image = rasterize(frame_view(ds, camera), _data->voxels, _data->voxel_size,
-                                          counts, cancel, mask, &frame.pixel_voxel);
+                                          counts, cancel, mask, false, &frame.pixel_voxel);
     check_cancel(cancel);
     frame.width = image.cols;
     frame.height = image.rows;
     frame.valid_pixels = image.valid_pixels;
     frame.part_pixels.resize((size_t)_data->num_parts);
     count_part_pixels(image, _data->voxel_parts, frame.part_pixels);
+    if (!_data->sky.empty()) {
+        const auto& sky = _data->sky[(size_t)camera];
+        frame.sky_valid_pixels = sky.valid_pixels;
+        frame.part_sky_pixels = sky.part_pixels;
+    }
     return frame;
 }
 
@@ -546,6 +727,9 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
         throw std::runtime_error("partition: LCC needs a seed point cloud");
     if (opt.lcc_min_track_length < 0)
         throw std::runtime_error("partition: LCC minimum track length must be nonnegative");
+    if (!std::isfinite(opt.lcc_sky_max_angle) || opt.lcc_sky_max_angle < 0 || opt.lcc_sky_max_angle > 180 ||
+        !std::isfinite(opt.lcc_sky_min_percent) || opt.lcc_sky_min_percent < 0 || opt.lcc_sky_min_percent > 100)
+        throw std::runtime_error("partition: invalid LCC sky ring angle or percentage");
     SeedRows seeds{ds.points.num(), {}};
     if (opt.lcc_min_track_length > 0) {
         if (!tracks || !tracks_usable(ds, *tracks))
@@ -565,6 +749,8 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
     const size_t n = (size_t)ds.num_cameras;
     const bool masked = masks && !masks->frames.empty();
     if (masked && masks->frames.size() != n) throw std::runtime_error("partition: LCC mask count mismatch");
+    if (masks && !masks->apertures.empty() && masks->apertures.size() != n)
+        throw std::runtime_error("partition: LCC aperture count mismatch");
     if (ds.image_filenames.size() != n || ds.widths.size() != n || ds.heights.size() != n || ds.intrins.size() != 4 * n ||
         ds.c2w.size() != 12 * n || (!ds.camera_models.empty() && ds.camera_models.size() != n) ||
         (!ds.camera_distortions.empty() && ds.camera_distortions.size() != n) ||
@@ -599,7 +785,7 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
         for (int64_t i = 0; i < ds.num_cameras; ++i) {
             if (cancel && cancel->load(std::memory_order_relaxed)) continue;
             const auto* mask = masked ? masks->frames[(size_t)i].get() : nullptr;
-            images[(size_t)i] = rasterize(frame_view(ds, i), voxels, size, counts, cancel, mask);
+            images[(size_t)i] = rasterize(frame_view(ds, i), voxels, size, counts, cancel, mask, opt.lcc_sky_ring);
         }
     }
     check_cancel(cancel);
@@ -636,7 +822,11 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
     p.spatial_parts = split_space(voxels, root, size, opt, cancel);
     p.num_parts = (int)p.spatial_parts.size();
     p.source = CovisibilitySource::Projection;
-    auto voxel_parts = assign_training_data(ds, seeds, voxels, images, p, cancel);
+    if (opt.lcc_sky_ring) {
+        if (log) log("LCC: estimating sky coverage for the outer ring");
+        estimate_sky_coverage(ds, p.spatial_parts, masks, opt.lcc_sky_max_angle, images, cancel);
+    }
+    auto voxel_parts = assign_training_data(ds, seeds, voxels, images, p, log, cancel);
     for (SpatialPart& block : p.spatial_parts)
         for (int axis = 0; axis < 3; ++axis) {
             block.core.lo[axis] += ds.center[(size_t)axis];
@@ -646,10 +836,17 @@ void partition_lcc(const ParsedDataset& ds, const SparseStats* tracks, ScenePart
         for (int k = 0; k < p.num_parts; ++k)
             log("LCC part " + std::to_string(k) + ": " +
                 std::to_string(p.spatial_parts[(size_t)k].gpixels) + " GPixels");
-    if (projection)
+    if (projection) {
+        std::vector<SkyCoverage> sky;
+        if (opt.lcc_sky_ring) {
+            sky.reserve(images.size());
+            for (auto& image : images) sky.push_back(std::move(image.sky));
+        }
         projection->_data = std::make_shared<LccProjectionDebug::Data>(
             LccProjectionDebug::Data{std::move(voxels), std::move(voxel_parts),
-                                    masked ? *masks : LccProjectionMasks{}, size, p.num_parts});
+                                    masked ? LccProjectionMasks{masks->frames, {}} : LccProjectionMasks{},
+                                    std::move(sky), size, p.num_parts});
+    }
 }
 
 }  // namespace spirula

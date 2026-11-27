@@ -952,6 +952,7 @@ ScenePartition partition_scene(const ParsedDataset& ds, const Covisibility& cov,
     if (opt.method != PartitionMethod::Lcc) {
         p.options.lcc_min_track_length = 0;
         p.options.lcc_robust_bounds = false;
+        p.options.lcc_sky_ring = false;
         p.options.lcc_lidar_cloud.clear();
         p.options.lcc_lidar_sample_fraction = 0.0;
     }
@@ -1632,6 +1633,9 @@ void write_partition(const ScenePartition& p, const std::string& json_path,
         w.field_raw("lcc_overlap", json_number_exact(p.options.lcc_overlap));
         w.field("lcc_min_track_length", p.options.lcc_min_track_length);
         w.field("lcc_robust_bounds", p.options.lcc_robust_bounds);
+        w.field("lcc_sky_ring", p.options.lcc_sky_ring);
+        w.field_raw("lcc_sky_max_angle", json_number_exact(p.options.lcc_sky_max_angle));
+        w.field_raw("lcc_sky_min_percent", json_number_exact(p.options.lcc_sky_min_percent));
         if (!p.options.lcc_lidar_cloud.empty()) {
             w.field("lcc_lidar_cloud", p.options.lcc_lidar_cloud);
             w.field_raw("lcc_lidar_sample_fraction", json_number_exact(p.options.lcc_lidar_sample_fraction));
@@ -1679,6 +1683,7 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
         root.find("format")->as_string() != "spirula-scene-partition")
         throw std::runtime_error(json_path + " is not a partition file");
     ScenePartition p;
+    p.options.lcc_sky_ring = false;
     if (dataset) *dataset = root.find("dataset") ? root.find("dataset")->as_string() : "";
     if (const JsonValue* s = root.find("source"))
         covisibility_source_from_name(s->as_string(), p.source);
@@ -1705,6 +1710,9 @@ ScenePartition read_partition(const std::string& json_path, std::string* dataset
         p.options.lcc_overlap = o->get_double("lcc_overlap", p.options.lcc_overlap);
         if (const JsonValue* robust = o->find("lcc_robust_bounds"))
             p.options.lcc_robust_bounds = robust->as_bool();
+        if (const JsonValue* sky = o->find("lcc_sky_ring")) p.options.lcc_sky_ring = sky->as_bool();
+        p.options.lcc_sky_max_angle = o->get_double("lcc_sky_max_angle", p.options.lcc_sky_max_angle);
+        p.options.lcc_sky_min_percent = o->get_double("lcc_sky_min_percent", p.options.lcc_sky_min_percent);
         if (const JsonValue* cloud = o->find("lcc_lidar_cloud"))
             p.options.lcc_lidar_cloud = cloud->as_string();
         p.options.lcc_lidar_sample_fraction = o->get_double("lcc_lidar_sample_fraction", 0.0);

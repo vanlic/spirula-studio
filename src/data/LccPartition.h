@@ -31,6 +31,8 @@ struct LccFrameProjection {
     int valid_pixels = 0;
     std::vector<int> pixel_voxel;  // Row-major, -1 for background.
     std::vector<int> part_pixels;
+    int sky_valid_pixels = 0;
+    std::vector<int> part_sky_pixels;  // -1 when the angle test rejected the pair.
 };
 
 constexpr int kLccRasterSize = 128;
@@ -38,9 +40,12 @@ using LccRasterMask = std::bitset<kLccRasterSize * kLccRasterSize>;
 
 struct LccProjectionMasks {
     std::vector<std::shared_ptr<const LccRasterMask>> frames;
+    std::vector<std::shared_ptr<const LccRasterMask>> apertures;
 };
 
 std::array<int, 2> lcc_raster_dimensions(int width, int height);
+bool lcc_is_fisheye(int camera_model);
+std::vector<uint8_t> lcc_raster_aperture(int width, int height, double cx, double cy, double rx, double ry);
 
 class LccProjectionDebug {
 public:

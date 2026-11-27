@@ -178,7 +178,7 @@ int run_split(int argc, char** argv) {
     else if (!lcc)
         std::printf("%s\n", format(P::log_covisibility_without_graph,
                                    {spirula::covisibility_source_name(cov.source)}).c_str());
-    const auto masks = lcc ? app::load_lcc_image_masks(ds, false, log) : spirula::LccProjectionMasks{};
+    const auto masks = lcc ? app::load_lcc_image_masks(ds, false, opt.lcc_sky_ring, log) : spirula::LccProjectionMasks{};
     const spirula::ScenePartition part = spirula::partition_scene(
         ds, cov, opt, lcc ? spirula::PartitionLog(log) : spirula::PartitionLog{}, nullptr, &tracks,
         nullptr, nullptr, &masks);

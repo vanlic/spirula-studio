@@ -261,7 +261,7 @@ void PartitionPanel::run_compute(spirula::LccLidarCache* cache) {
         _cov_valid = true;
     }
     spirula::LccProjectionDebug projection;
-    const auto masks = lcc ? app::load_lcc_image_masks(_ds, _mask_flipped, log, &_cancel)
+    const auto masks = lcc ? app::load_lcc_image_masks(_ds, _mask_flipped, opt.lcc_sky_ring, log, &_cancel)
                            : spirula::LccProjectionMasks{};
     spirula::ScenePartition part = spirula::partition_scene(_ds, _cov, opt, log, &_cancel, &_tracks, cache,
                                                             lcc ? &projection : nullptr, &masks);
@@ -407,7 +407,8 @@ bool PartitionPanel::options_changed() const {
            a.lcc_overlap != b.lcc_overlap || a.lcc_min_track_length != b.lcc_min_track_length ||
            a.lcc_robust_bounds != b.lcc_robust_bounds ||
            (b.method == spirula::PartitionMethod::Lcc &&
-            (a.lcc_lidar_cloud != b.lcc_lidar_cloud ||
+            (a.lcc_sky_ring != b.lcc_sky_ring || a.lcc_sky_max_angle != b.lcc_sky_max_angle ||
+             a.lcc_sky_min_percent != b.lcc_sky_min_percent || a.lcc_lidar_cloud != b.lcc_lidar_cloud ||
              (!b.lcc_lidar_cloud.empty() && a.lcc_lidar_sample_fraction != b.lcc_lidar_sample_fraction))) ||
            a.projection_depth_slack != b.projection_depth_slack ||
            a.proximity_neighbours != b.proximity_neighbours ||
@@ -666,13 +667,15 @@ void PartitionPanel::draw_projection() {
         upload_projection();
     }
     ui::TextDisabledWrapped(pmsg::projection_legend);
+    const bool sky = _part.options.lcc_sky_ring;
     const float rows = (float)std::min(frame.part_pixels.size() + 1, size_t(6));
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY;
-    if (ImGui::BeginTable("##projection_parts", 2, flags,
+    if (ImGui::BeginTable("##projection_parts", sky ? 3 : 2, flags,
                           ImVec2(0, ImGui::GetFrameHeightWithSpacing() * (rows + 0.5f)))) {
         ImGui::TableSetupScrollFreeze(0, 1);
         ui::TableSetupColumn(pmsg::col_part);
         ui::TableSetupColumn(pmsg::projection_coverage);
+        if (sky) ui::TableSetupColumn(pmsg::projection_sky_coverage);
         ImGui::TableHeadersRow();
         for (size_t part = 0; part < frame.part_pixels.size(); ++part) {
             ImGui::TableNextRow();
@@ -691,6 +694,17 @@ void PartitionPanel::draw_projection() {
             else
                 std::snprintf(value, sizeof value, "-- (0 / 0)");
             ui::TextRaw(value);
+            if (sky) {
+                ImGui::TableNextColumn();
+                const int pixels = frame.part_sky_pixels.empty() ? -1 : frame.part_sky_pixels[part];
+                if (pixels >= 0 && frame.sky_valid_pixels > 0) {
+                    std::snprintf(value, sizeof value, "%.2f%% (%d / %d)",
+                                  100.0 * pixels / frame.sky_valid_pixels, pixels, frame.sky_valid_pixels);
+                    ui::TextRaw(value);
+                } else {
+                    ui::TextRaw("--");
+                }
+            }
         }
         ImGui::EndTable();
     }
@@ -778,6 +792,17 @@ void PartitionPanel::draw_controls() {
         if (ui::InputDouble(pmsg::lbl_lcc_overlap, &_opt.lcc_overlap, "%g"))
             _opt.lcc_overlap = std::max(0.0, _opt.lcc_overlap);
         ui::help_on_hover(pmsg::opt_lcc_overlap);
+        ui::Checkbox(pmsg::lbl_lcc_sky_ring, &_opt.lcc_sky_ring);
+        ui::help_on_hover(pmsg::opt_lcc_sky_ring);
+        ImGui::BeginDisabled(!_opt.lcc_sky_ring);
+        ImGui::SetNextItemWidth(px(120.0f));
+        if (ui::InputDouble(pmsg::lbl_lcc_sky_angle, &_opt.lcc_sky_max_angle, "%g"))
+            _opt.lcc_sky_max_angle = std::clamp(_opt.lcc_sky_max_angle, 0.0, 180.0);
+        ui::help_on_hover_disabled(pmsg::opt_lcc_sky_angle);
+        ImGui::SetNextItemWidth(px(120.0f));
+        if (ui::InputDouble(pmsg::lbl_lcc_sky_percent, &_opt.lcc_sky_min_percent, "%g"))
+            _opt.lcc_sky_min_percent = std::clamp(_opt.lcc_sky_min_percent, 0.0, 100.0);
+        ImGui::EndDisabled();
         ui::Checkbox(pmsg::lbl_lcc_robust_bounds, &_opt.lcc_robust_bounds);
         ui::help_on_hover(pmsg::opt_lcc_robust_bounds);
         ImGui::BeginDisabled(!_loaded || !spirula::tracks_usable(_ds, _tracks));

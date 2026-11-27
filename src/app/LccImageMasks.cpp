@@ -1,12 +1,10 @@
 #include "app/LccImageMasks.h"
 
 #include "app/FrameMask.h"
-#include "core/CameraModel.h"
 #include "core/ImageOrient.h"
 #include "data/MaskDecode.h"
 
 #include <algorithm>
-#include <cmath>
 #include <exception>
 #include <filesystem>
 #include <map>
@@ -30,22 +28,9 @@ std::shared_ptr<const spirula::LccRasterMask> pack_mask(const std::vector<uint8_
     return mask;
 }
 
-std::vector<uint8_t> rasterize_aperture(const MaskShape& aperture, int width, int height) {
-    std::vector<uint8_t> pixels((size_t)width * height);
-    const double hx = 0.5 / width, hy = 0.5 / height;
-    for (int y = 0; y < height; ++y) {
-        const double dy = (std::abs((y + 0.5) / height - aperture.cy) + hy) / aperture.ry;
-        for (int x = 0; x < width; ++x) {
-            const double dx = (std::abs((x + 0.5) / width - aperture.cx) + hx) / aperture.rx;
-            pixels[(size_t)y * width + x] = dx * dx + dy * dy <= 1.0;
-        }
-    }
-    return pixels;
-}
-
 }  // namespace
 
-spirula::LccProjectionMasks load_lcc_image_masks(const ParsedDataset& ds, bool flip_mask,
+spirula::LccProjectionMasks load_lcc_image_masks(const ParsedDataset& ds, bool flip_mask, bool keep_aperture,
                                                  const spirula::PartitionLog& log,
                                                  const std::atomic<bool>* cancel) {
     namespace fs = std::filesystem;
@@ -53,6 +38,7 @@ spirula::LccProjectionMasks load_lcc_image_masks(const ParsedDataset& ds, bool f
     const size_t frames = (size_t)ds.num_cameras;
     spirula::LccProjectionMasks result;
     result.frames.resize(frames);
+    if (keep_aperture) result.apertures.resize(frames);
     std::exception_ptr decode_error;
     size_t file_masks = 0;
     if (!ds.mask_filenames.empty()) {
@@ -82,8 +68,7 @@ spirula::LccProjectionMasks load_lcc_image_masks(const ParsedDataset& ds, bool f
     using Lens = std::tuple<fs::path, int, int>;
     std::map<Lens, std::vector<size_t>> lenses;
     for (size_t frame = 0; frame < frames && !ds.camera_models.empty(); ++frame) {
-        const auto model = (CameraModelType)ds.camera_models[frame];
-        if (model != CameraModelType::FISHEYE && model != CameraModelType::EQUISOLID) continue;
+        if (!spirula::lcc_is_fisheye(ds.camera_models[frame])) continue;
         int w = ds.widths[frame], h = ds.heights[frame];
         spirula::oriented_size(quarter_turns(ds, frame), w, h);
         if (w <= 0 || h <= 0) continue;
@@ -94,7 +79,7 @@ spirula::LccProjectionMasks load_lcc_image_masks(const ParsedDataset& ds, bool f
     };
     for (const auto& [lens, indices] : lenses) {
         if (cancelled(cancel)) throw spirula::PartitionCancelled();
-        if (std::all_of(indices.begin(), indices.end(), has_file)) continue;
+        if (!keep_aperture && std::all_of(indices.begin(), indices.end(), has_file)) continue;
         std::vector<std::string> photos;
         photos.reserve(indices.size());
         for (size_t frame : indices) photos.push_back(ds.image_filenames[frame]);
@@ -107,14 +92,15 @@ spirula::LccProjectionMasks load_lcc_image_masks(const ParsedDataset& ds, bool f
         if (!border.found) continue;
         std::map<std::tuple<int, int, int>, std::shared_ptr<const spirula::LccRasterMask>> raster_masks;
         for (size_t frame : indices) {
-            if (has_file(frame)) continue;
+            if (!keep_aperture && has_file(frame)) continue;
             const auto [cols, rows] = lcc_raster_dimensions(ds.widths[frame], ds.heights[frame]);
             const int turns = quarter_turns(ds, frame);
             auto [it, fresh] = raster_masks.try_emplace({cols, rows, turns});
             if (fresh) {
                 int w = cols, h = rows;
                 spirula::oriented_size(turns, w, h);
-                auto pixels = rasterize_aperture(border.shape, w, h);
+                const auto& circle = border.shape;
+                auto pixels = spirula::lcc_raster_aperture(w, h, circle.cx, circle.cy, circle.rx, circle.ry);
                 if (turns != 0) {
                     std::vector<uint8_t> turned(pixels.size());
                     spirula::orient_pixels(pixels.data(), w, h, 1, turns, false, turned.data());
@@ -122,7 +108,8 @@ spirula::LccProjectionMasks load_lcc_image_masks(const ParsedDataset& ds, bool f
                 }
                 it->second = pack_mask(pixels);
             }
-            result.frames[frame] = it->second;
+            if (!has_file(frame)) result.frames[frame] = it->second;
+            if (keep_aperture) result.apertures[frame] = it->second;
         }
     }
     if (std::none_of(result.frames.begin(), result.frames.end(), [](const auto& mask) { return bool(mask); }))

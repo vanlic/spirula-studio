@@ -54,6 +54,9 @@ struct PartitionOptions {
     double lcc_overlap = 0.0;
     int lcc_min_track_length = 0;
     bool lcc_robust_bounds = false;
+    bool lcc_sky_ring = true;
+    double lcc_sky_max_angle = 75.0;
+    double lcc_sky_min_percent = 10.0;
     std::string lcc_lidar_cloud;
     double lcc_lidar_sample_fraction = 0.0;
 };

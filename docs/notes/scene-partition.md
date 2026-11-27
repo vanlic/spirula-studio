@@ -83,6 +83,12 @@ remain open so the merge can retain geometry beyond the seed cloud.
 Boxes and per-block loads are saved in partition JSON alongside the
 usual image and seed tables.
 
+Sky ring images use open upward rays passing above a block on the same
+128-pixel raster. Existing masks and the fish-eye aperture limit the valid
+pixels. The panel defaults to a 75° angle limit from a fish-eye camera's
+axis to the nearest point on the core boundary and a sky threshold of 10%
+of valid pixels. The projection debug tab shows the per-block estimate.
+
 ### Voronoi partition
 
 Voronoi uses deterministic farthest-point initialization followed by Lloyd
