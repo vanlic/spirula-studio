@@ -61,13 +61,18 @@ void draw_part_swatch(int part) {
     ImGui::SameLine();
 }
 
-void draw_projection_image(const PreviewTexture& texture, const spirula::i18n::Msg& title) {
+void draw_projection_image(const PreviewTexture& texture, const spirula::i18n::Msg& title, bool point_sample = false) {
     ui::Text(title);
     const ImVec2 box = ImGui::GetContentRegionAvail();
     if (box.x <= 0 || box.y <= 0) return;
     ImVec2 lo, hi;
     fit_rect((float)texture.w, (float)texture.h, ImGui::GetCursorScreenPos(), box, lo, hi);
-    ImGui::GetWindowDrawList()->AddImage(texture.id(), lo, hi);
+    auto* draw = ImGui::GetWindowDrawList();
+    const auto& io = ImGui::GetPlatformIO();
+    const bool point = point_sample && io.DrawCallback_SetSamplerNearest && io.DrawCallback_SetSamplerLinear;
+    if (point) draw->AddCallback(io.DrawCallback_SetSamplerNearest, nullptr);
+    draw->AddImage(texture.id(), lo, hi);
+    if (point) draw->AddCallback(io.DrawCallback_SetSamplerLinear, nullptr);
     ImGui::Dummy(box);
 }
 
@@ -692,7 +697,7 @@ void PartitionPanel::draw_projection() {
     const bool photo = _projection_photo.ready();
     if (ImGui::BeginTable("##projection_images", photo ? 2 : 1, ImGuiTableFlags_SizingStretchSame)) {
         ImGui::TableNextColumn();
-        if (_projection_texture.ready()) draw_projection_image(_projection_texture, pmsg::projection_mask);
+        if (_projection_texture.ready()) draw_projection_image(_projection_texture, pmsg::projection_mask, true);
         if (photo) {
             ImGui::TableNextColumn();
             draw_projection_image(_projection_photo, pmsg::projection_photo);

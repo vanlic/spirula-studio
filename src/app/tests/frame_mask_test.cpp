@@ -495,6 +495,28 @@ void test_svg_hand_made() {
     check(!app::read_mask_svg("hello", out, title, err), "not an SVG is refused");
 }
 
+void test_dark_barrel_refinement() {
+    constexpr int side = 256;
+    constexpr float inner_radius = 75.0f, outer_radius = 81.0f;
+    std::vector<uint8_t> pixels(side * side);
+    for (int y = 0; y < side; ++y)
+        for (int x = 0; x < side; ++x) {
+            const float r = std::hypot((float)x - 121, (float)y - 133);
+            pixels[y * side + x] = r < inner_radius ? 160 : r < outer_radius ? 50 : 0;
+        }
+    app::BorderAccumulator acc;
+    acc.add(pixels.data(), side, side, 1);
+    acc.add(pixels.data(), side, side, 1);
+    app::BorderDetectOptions options;
+    options.shrink = 0.0f;
+    const auto outer = acc.finish(options);
+    options.refine_dark_rim = true;
+    const auto inner = acc.finish(options);
+    check(outer.found && inner.found && std::abs(outer.shape.rx * side - outer_radius) < 2.0f &&
+              std::abs(inner.shape.rx * side - inner_radius) < 2.0f,
+          "dark border refinement excludes the lit barrel");
+}
+
 void test_border_adjustment() {
     constexpr int W = 160, H = 200;
     app::BorderAccumulator acc;
@@ -779,6 +801,7 @@ int main() {
     test_svg_round_trip();
     test_svg_hand_made();
     test_border_adjustment();
+    test_dark_barrel_refinement();
     test_bezier();
     test_per_camera_stencil();
     test_camera_sets();

@@ -382,6 +382,8 @@ struct CircleFit {
     float rms = 0.0f;       // over those, fraction of the radius
 };
 
+constexpr float kBarrelBand = 0.08f;
+
 // Per ray, where the averaged picture steps down to the lens barrel -- on OSV a
 // darker band 5% of the radius wide before the black: the innermost drop within
 // 8% inside the deepest and 40% as deep. The deepest alone is often the band's end.
@@ -432,7 +434,7 @@ void mean_edges(const std::vector<float>& mean, int w, int h, float cx, float cy
             if (dv[i] < dv[deepest]) deepest = i;
         if (dv[deepest] > -1.0f) continue;   // luma per half pixel
         int edge = deepest;
-        const int band = (int)(0.08f * r0 / kStep);
+        const int band = (int)(kBarrelBand * r0 / kStep);
         for (int i = std::max(3, deepest - band); i < deepest; i++)
             if (dv[i] <= 0.4f * dv[deepest] && dv[i] <= dv[i - 1] && dv[i] <= dv[i + 1]) {
                 edge = i;
@@ -985,6 +987,14 @@ BorderDetect BorderAccumulator::finish(const BorderDetectOptions& o) const {
     if (!found && d.dark_fraction >= 0.02f) {
         d.cue = BorderCue::Dark;
         found = fit(lit, nullptr, nullptr, nullptr, f);
+        if (found && o.refine_dark_rim) {
+            const float prior[] = {f.c.cx, f.c.cy};
+            CircleFit inner;
+            const float band = kBarrelBand + 2 * o.tolerance;
+            if (fit(lit, &lit, &mean, prior, inner) && inner.c.r >= f.c.r * (1 - band) &&
+                inner.c.r < f.c.r && std::hypot(inner.c.cx - f.c.cx, inner.c.cy - f.c.cy) + inner.c.r <= f.c.r)
+                f = inner;
+        }
     }
     const MaskShape shape = to_shape(f.c, o.shrink, w, h);
     const float kept = found ? kept_fraction(shape, w, h) : 1.0f;

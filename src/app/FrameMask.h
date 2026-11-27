@@ -78,6 +78,7 @@ struct BorderDetectOptions {
     float tolerance = 0.006f;   // a ray's edge this far off r is not on the circle
     float min_support = 0.1f;   // fraction of the rays that must be on it
     float max_outside = 0.3f;   // fraction of the frame past 1.1 r allowed to be busy
+    bool  refine_dark_rim = false;
 };
 
 // How the lens was told from the scene. Activity leads and puts the edge where

@@ -6,10 +6,10 @@
 #include "data/MaskDecode.h"
 
 #include <algorithm>
+#include <cmath>
 #include <exception>
 #include <filesystem>
 #include <map>
-#include <stdexcept>
 #include <tuple>
 
 namespace app {
@@ -28,6 +28,19 @@ std::shared_ptr<const spirula::LccRasterMask> pack_mask(const std::vector<uint8_
     auto mask = std::make_shared<spirula::LccRasterMask>();
     for (size_t i = 0; i < pixels.size(); ++i) (*mask)[i] = pixels[i] != 0;
     return mask;
+}
+
+std::vector<uint8_t> rasterize_aperture(const MaskShape& aperture, int width, int height) {
+    std::vector<uint8_t> pixels((size_t)width * height);
+    const double hx = 0.5 / width, hy = 0.5 / height;
+    for (int y = 0; y < height; ++y) {
+        const double dy = (std::abs((y + 0.5) / height - aperture.cy) + hy) / aperture.ry;
+        for (int x = 0; x < width; ++x) {
+            const double dx = (std::abs((x + 0.5) / width - aperture.cx) + hx) / aperture.rx;
+            pixels[(size_t)y * width + x] = dx * dx + dy * dy <= 1.0;
+        }
+    }
+    return pixels;
 }
 
 }  // namespace
@@ -85,12 +98,13 @@ spirula::LccProjectionMasks load_lcc_image_masks(const ParsedDataset& ds, bool f
         std::vector<std::string> photos;
         photos.reserve(indices.size());
         for (size_t frame : indices) photos.push_back(ds.image_filenames[frame]);
-        const BorderDetect border = detect_fisheye_border(photos, {}, false, cancel);
+        BorderDetectOptions options;
+        options.refine_dark_rim = true;
+        const BorderDetect border = detect_fisheye_border(photos, options, false, cancel);
         if (cancelled(cancel)) throw spirula::PartitionCancelled();
         const std::string folder = std::get<0>(lens).u8string();
         if (log) log(std::string(border.found ? "LCC: fitted fisheye border in " : "LCC: no fisheye border found in ") + folder);
         if (!border.found) continue;
-        const FrameMask stencil{{border.shape}, {}};
         std::map<std::tuple<int, int, int>, std::shared_ptr<const spirula::LccRasterMask>> raster_masks;
         for (size_t frame : indices) {
             if (has_file(frame)) continue;
@@ -100,10 +114,7 @@ spirula::LccProjectionMasks load_lcc_image_masks(const ParsedDataset& ds, bool f
             if (fresh) {
                 int w = cols, h = rows;
                 spirula::oriented_size(turns, w, h);
-                std::vector<uint8_t> pixels;
-                std::string error;
-                if (!rasterize_frame_mask(stencil, w, h, pixels, error))
-                    throw std::runtime_error("LCC: cannot rasterize the fisheye border: " + error);
+                auto pixels = rasterize_aperture(border.shape, w, h);
                 if (turns != 0) {
                     std::vector<uint8_t> turned(pixels.size());
                     spirula::orient_pixels(pixels.data(), w, h, 1, turns, false, turned.data());
